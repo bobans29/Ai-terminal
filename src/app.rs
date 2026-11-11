@@ -43,6 +43,10 @@ struct App {
     modifiers: ModifiersState,
     pointer: PhysicalPosition<f64>,
     selecting: bool,
+    /// Bits 0..2 are left, middle, and right while held.
+    mouse_buttons: u8,
+    /// Unused pixel movement from touchpad scrolling.
+    pixel_scroll: f32,
     composing: bool,
     focused: bool,
     cursor_on: bool,
@@ -82,6 +86,8 @@ impl App {
             modifiers: ModifiersState::empty(),
             pointer: PhysicalPosition::new(0.0, 0.0),
             selecting: false,
+            mouse_buttons: 0,
+            pixel_scroll: 0.0,
             composing: false,
             focused: true,
             cursor_on: true,
@@ -388,7 +394,7 @@ impl App {
         let Some(text) = self.clipboard_get() else {
             return;
         };
-        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        let normalized = input::sanitize_paste(&text);
         let mode = self
             .terminal
             .as_ref()
@@ -453,14 +459,48 @@ impl App {
             .unwrap_or(false)
     }
 
+    fn note_button(&mut self, button: MouseButton, pressed: bool) {
+        let Some(code) = input::mouse_button_code(button) else {
+            return;
+        };
+        let mask = 1u8 << code.min(7);
+        if pressed {
+            self.mouse_buttons |= mask;
+        } else {
+            self.mouse_buttons &= !mask;
+        }
+    }
+
+    /// Lowest held button, which is what a drag report names.
+    fn held_button(&self) -> Option<u16> {
+        if self.mouse_buttons & 1 != 0 {
+            Some(0)
+        } else if self.mouse_buttons & 2 != 0 {
+            Some(1)
+        } else if self.mouse_buttons & 4 != 0 {
+            Some(2)
+        } else {
+            None
+        }
+    }
+
     fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
+        let pressed = state == ElementState::Pressed;
+        if pressed {
+            self.note_button(button, true);
+        }
         let shift = self.modifiers.shift_key();
         if self.mouse_mode() && !shift {
             if let Some(code) = input::mouse_button_code(button) {
-                let press = state == ElementState::Pressed;
-                self.send_mouse(code, press);
+                self.send_mouse(code, pressed);
+            }
+            if !pressed {
+                self.note_button(button, false);
             }
             return;
+        }
+        if !pressed {
+            self.note_button(button, false);
         }
         if button != MouseButton::Left {
             return;
@@ -503,8 +543,13 @@ impl App {
             };
             let drag = mode.contains(TermMode::MOUSE_DRAG);
             let motion = mode.contains(TermMode::MOUSE_MOTION);
-            if motion || drag {
-                self.send_mouse(32, true);
+            // 32 added to the button code means motion. Button 3 is no button.
+            if let Some(button) = self.held_button() {
+                if motion || drag {
+                    self.send_mouse(button + 32, true);
+                }
+            } else if motion {
+                self.send_mouse(3 + 32, true);
             }
         }
     }
@@ -517,7 +562,9 @@ impl App {
             .unwrap_or(16.0);
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, y) => input::notch_to_lines(y),
-            MouseScrollDelta::PixelDelta(pos) => input::pixels_to_lines(pos.y, cell_h),
+            MouseScrollDelta::PixelDelta(pos) => {
+                input::consume_pixel_scroll(&mut self.pixel_scroll, pos.y as f32, cell_h)
+            }
         };
         if lines == 0 {
             return;

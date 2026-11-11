@@ -53,11 +53,42 @@ pub fn notch_to_lines(notches: f32) -> i32 {
     quantize(notches * 3.0)
 }
 
-pub fn pixels_to_lines(pixels: f64, cell_height: f32) -> i32 {
+/// Add pixel movement to a running remainder and return only whole cells.
+///
+/// Touchpads emit many one-pixel events. Rounding each one up to a line makes
+/// the scroll distance depend on how the platform batches those events.
+pub fn consume_pixel_scroll(pending_px: &mut f32, delta_px: f32, cell_height: f32) -> i32 {
     if cell_height < 1.0 {
         return 0;
     }
-    quantize((pixels / f64::from(cell_height)) as f32)
+    *pending_px += delta_px;
+    let lines = (*pending_px / cell_height).trunc();
+    if lines == 0.0 {
+        return 0;
+    }
+    *pending_px -= lines * cell_height;
+    lines as i32
+}
+
+/// Bracketed paste must not contain ESC. A payload of `\x1b[201~` would end
+/// paste mode, and the rest would be typed as shell input.
+pub fn sanitize_paste(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\r');
+            }
+            '\n' => out.push('\r'),
+            '\u{1b}' | '\u{9b}' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn quantize(lines: f32) -> i32 {
@@ -88,7 +119,9 @@ pub fn encode_mouse(code: u16, col: usize, row: usize, press: bool, mode: TermMo
         let action = if press { 'M' } else { 'm' };
         format!("\x1b[<{code};{col};{row}{action}").into_bytes()
     } else {
-        let cb = (code as u8).saturating_add(32);
+        // X10 has no release flag. Button code 3 is the release event.
+        let reported = if press { code } else { 3 };
+        let cb = (reported as u8).saturating_add(32);
         let cx = (col.min(223) as u8).saturating_add(32);
         let cy = (row.min(223) as u8).saturating_add(32);
         vec![0x1b, b'[', b'M', cb, cx, cy]
@@ -345,6 +378,34 @@ mod tests {
         assert_eq!(notch_to_lines(1.0), 3);
         assert_eq!(notch_to_lines(-1.0), -3);
         assert_eq!(notch_to_lines(0.2), 1);
+    }
+
+    #[test]
+    fn pixel_scroll_accumulates_sub_cell_deltas() {
+        let mut pending = 0.0;
+        let mut total = 0;
+        for _ in 0..38 {
+            total += consume_pixel_scroll(&mut pending, 1.0, 19.0);
+        }
+        assert_eq!(total, 2);
+        assert!(pending.abs() < 0.01);
+    }
+
+    #[test]
+    fn paste_cannot_end_bracketed_mode() {
+        let payload = sanitize_paste("hi\u{1b}[201~echo pwned\r\n");
+        assert!(!payload.contains('\u{1b}'));
+        assert_eq!(payload, "hi[201~echo pwned\r");
+    }
+
+    #[test]
+    fn legacy_mouse_release_uses_button_3() {
+        let press = encode_mouse(0, 1, 2, true, TermMode::empty());
+        let release = encode_mouse(0, 1, 2, false, TermMode::empty());
+        assert_eq!(press[3], 32);
+        assert_eq!(release[3], 35);
+        let sgr = encode_mouse(0, 0, 0, false, TermMode::SGR_MOUSE);
+        assert_eq!(sgr, b"\x1b[<0;1;1m");
     }
 
     #[cfg(not(target_os = "macos"))]

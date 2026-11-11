@@ -247,6 +247,11 @@ impl Renderer {
         let cursor_shape = content.cursor.shape;
         let selection = content.selection;
         let display_offset = content.display_offset;
+        // Backgrounds first, then glyphs. A wide character is drawn from its
+        // first cell and overlaps the spacer; the spacer's background must not
+        // paint over that glyph.
+        let mut backs = Vec::new();
+        let mut front = Vec::new();
 
         for indexed in content.display_iter {
             let Some(vp) = point_to_viewport(display_offset, indexed.point) else {
@@ -285,7 +290,7 @@ impl Renderer {
             }
 
             if bg != palette.background || block || selected {
-                push_solid(&mut verts, width, height, x, y, cell_w, cell_h, bg);
+                push_solid(&mut backs, width, height, x, y, cell_w, cell_h, bg);
             }
 
             let spacer =
@@ -304,7 +309,7 @@ impl Renderer {
                     let gx = x + glyph.xmin as f32;
                     let gy = y + ascent - (glyph.ymin as f32 + glyph.h as f32);
                     push_glyph(
-                        &mut verts,
+                        &mut front,
                         width,
                         height,
                         gx,
@@ -319,7 +324,7 @@ impl Renderer {
                     );
                     if glyph.fake_bold {
                         push_glyph(
-                            &mut verts,
+                            &mut front,
                             width,
                             height,
                             gx + 1.0,
@@ -343,18 +348,18 @@ impl Renderer {
             };
             if flags.intersects(Flags::ALL_UNDERLINES) && !flags.contains(Flags::HIDDEN) {
                 let uy = y + ascent + 1.0;
-                push_solid(&mut verts, width, height, x, uy, span, 1.0, fg);
+                push_solid(&mut front, width, height, x, uy, span, 1.0, fg);
             }
             if flags.contains(Flags::STRIKEOUT) && !flags.contains(Flags::HIDDEN) {
                 let sy = y + cell_h * 0.55;
-                push_solid(&mut verts, width, height, x, sy, span, 1.0, fg);
+                push_solid(&mut front, width, height, x, sy, span, 1.0, fg);
             }
 
             if indexed.point == cursor_point && cursor_shape != CursorShape::Hidden {
                 match cursor {
                     CursorPaint::Hollow => {
                         stroke_rect(
-                            &mut verts,
+                            &mut front,
                             width,
                             height,
                             x,
@@ -367,7 +372,7 @@ impl Renderer {
                     CursorPaint::Active => match cursor_shape {
                         CursorShape::Beam => {
                             push_solid(
-                                &mut verts,
+                                &mut front,
                                 width,
                                 height,
                                 x,
@@ -379,7 +384,7 @@ impl Renderer {
                         }
                         CursorShape::Underline => {
                             push_solid(
-                                &mut verts,
+                                &mut front,
                                 width,
                                 height,
                                 x,
@@ -391,7 +396,7 @@ impl Renderer {
                         }
                         CursorShape::HollowBlock => {
                             stroke_rect(
-                                &mut verts,
+                                &mut front,
                                 width,
                                 height,
                                 x,
@@ -407,6 +412,8 @@ impl Renderer {
                 }
             }
         }
+        verts.extend(backs);
+        verts.extend(front);
         verts
     }
 

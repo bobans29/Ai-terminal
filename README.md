@@ -87,7 +87,8 @@ Ctrl+Tab is swallowed so a later tab switcher can have it.
 - Bold and italic are used when a distinct font file exists. Otherwise bold is a one-pixel overstrike and italic is the regular face.
 - IME commit strings are written to the shell. The preedit popup is not drawn. This path has not been tried on Windows.
 - Mouse reporting is SGR and a basic X10 encoding. There is no kitty keyboard protocol.
-- In the alternate screen, the wheel sends arrow keys (vim/less) instead of scrolling history. Shift+wheel still scrolls.
+- In the alternate screen, the wheel sends arrow keys (vim/less) instead of scrolling history. Shift+wheel still scrolls. Touchpad pixel deltas accumulate until they cover a full cell.
+- Bracketed paste strips ESC bytes, so clipboard text cannot end paste mode early and run as shell input.
 - `shell` is a program path. It is not parsed as a command line.
 - Windows and macOS code paths are `cfg`-gated and compile as part of the same sources, but they have not been built or run on those systems. The owner is on Windows: ConPTY and the default `%COMSPEC%` shell are the pieces most worth trying first. The Linux demo below used lavapipe, a software Vulkan adapter, so it does not prove a hardware GPU.
 

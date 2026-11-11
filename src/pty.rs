@@ -7,6 +7,7 @@
 //! can own a [`PtySession`] without a window.
 
 use std::io::{Read, Write};
+use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -18,11 +19,14 @@ pub enum PtyMsg {
 
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// Input is queued here. The writer thread performs the blocking write so
+    /// a child that stops reading cannot freeze the window.
+    writer_tx: Option<Sender<Vec<u8>>>,
     child: Box<dyn Child + Send + Sync>,
     /// Kept so the reader thread is not detached from our point of view.
     /// It exits on its own when the master is dropped or the child dies.
     _reader: Option<JoinHandle<()>>,
+    _writer: Option<JoinHandle<()>>,
 }
 
 impl PtySession {
@@ -76,22 +80,30 @@ impl PtySession {
             .name("pty-reader".to_string())
             .spawn(move || read_loop(reader, on_output))
             .map_err(|err| format!("starting pty reader: {err}"))?;
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer_thread = std::thread::Builder::new()
+            .name("pty-writer".to_string())
+            .spawn(move || write_loop(writer, writer_rx))
+            .map_err(|err| format!("starting pty writer: {err}"))?;
 
         Ok(Self {
             master: pair.master,
-            writer,
+            writer_tx: Some(writer_tx),
             child,
             _reader: Some(reader_thread),
+            _writer: Some(writer_thread),
         })
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<(), String> {
-        self.writer
-            .write_all(data)
-            .map_err(|err| format!("writing to pty: {err}"))?;
-        self.writer
-            .flush()
-            .map_err(|err| format!("flushing pty: {err}"))
+        if data.is_empty() {
+            return Ok(());
+        }
+        let Some(tx) = self.writer_tx.as_ref() else {
+            return Err("pty writer closed".to_string());
+        };
+        tx.send(data.to_vec())
+            .map_err(|_| "pty writer closed".to_string())
     }
 
     pub fn resize(
@@ -114,7 +126,23 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
+        // Drop the sender so the writer thread can finish, then kill the
+        // child. That unblocks a write stuck on a full PTY buffer. The
+        // handles are detached on drop so shutdown does not wait on them.
+        self.writer_tx.take();
         let _ = self.child.kill();
+    }
+}
+
+fn write_loop(mut writer: Box<dyn Write + Send>, rx: mpsc::Receiver<Vec<u8>>) {
+    while let Ok(data) = rx.recv() {
+        if writer
+            .write_all(&data)
+            .and_then(|_| writer.flush())
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
