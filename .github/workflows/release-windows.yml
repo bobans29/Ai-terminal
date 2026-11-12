@@ -1,0 +1,57 @@
+name: Windows release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (for example v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release tag
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Use a tag such as v0.1.0' }
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component clippy
+      - name: Validate and build
+        run: |
+          cargo +1.99.1 clippy --locked --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.99.1 test --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.99.1 build --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\aiterm.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package portable executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/aiterm.exe dist/aiterm.exe
+          Copy-Item config.example.toml, README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath aiterm-windows-x86_64.zip
+          (Get-FileHash aiterm-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant() | Set-Content -Encoding ascii aiterm-windows-x86_64.zip.sha256
+          Copy-Item scripts/windows/install.ps1 install.ps1
+      - name: Publish portable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:RELEASE_TAG --target $env:GITHUB_SHA --title "aiterm $env:RELEASE_TAG" --generate-notes aiterm-windows-x86_64.zip aiterm-windows-x86_64.zip.sha256 install.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
