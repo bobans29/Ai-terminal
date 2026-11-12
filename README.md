@@ -40,6 +40,8 @@ The first launch prints the config path it looked for and the GPU adapter it ope
 
 ### Windows build from source
 
+Release builds open only the aiterm window. Debug builds (`cargo run`) retain a separate console for startup logs.
+
 Use Windows 10 version 1809 or later (ConPTY is required), or Windows 11, on x86-64. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) with **Desktop development with C++**, including the MSVC x64 build tools and a Windows SDK, then install Rust with the MSVC host toolchain using [rustup](https://rustup.rs/). A Direct3D 12 or Vulkan-capable graphics driver and a monospace font such as Consolas are required.
 
 From a PowerShell terminal in the checkout:

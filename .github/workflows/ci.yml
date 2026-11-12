@@ -33,6 +33,14 @@ jobs:
       - name: Check executable
         if: runner.os == 'Windows'
         run: .\target\release\aiterm.exe --help
+      - name: Verify Windows release has no extra console
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $image = [IO.File]::ReadAllBytes((Resolve-Path 'target/release/aiterm.exe'))
+          $peOffset = [BitConverter]::ToInt32($image, 0x3c)
+          $subsystem = [BitConverter]::ToUInt16($image, $peOffset + 24 + 68)
+          if ($subsystem -ne 2) { throw 'Release must use the Windows GUI subsystem (2).' }
       - name: Test release source selection
         if: runner.os == 'Windows'
         run: pwsh -NoProfile -File scripts/windows/test-release-source.ps1
