@@ -7,6 +7,7 @@
 //! draws italic as regular.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 use fontdue::Font;
@@ -166,6 +167,7 @@ fn fontconfig(family: &str, kind: FaceKind) -> Option<PathBuf> {
     }
 }
 
+#[cfg(unix)]
 fn family_matches(got: &str, want: &str) -> bool {
     let want_n = normalize(want);
     if want_n.is_empty() {
@@ -185,6 +187,7 @@ fn normalize(text: &str) -> String {
 }
 
 impl FaceKind {
+    #[cfg(unix)]
     fn style_name(self) -> &'static str {
         match self {
             Self::Regular => "Regular",
@@ -209,6 +212,23 @@ impl FaceKind {
     }
 
     fn filename_matches(self, file_name: &str) -> bool {
+        // Windows ships these families with abbreviated filenames rather than
+        // words such as "Bold". Without this mapping every face looks regular.
+        let stem = Path::new(file_name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(file_name)
+            .to_ascii_lowercase();
+        let abbreviated = match stem.as_str() {
+            "consola" | "cour" => Some(Self::Regular),
+            "consolab" | "courbd" => Some(Self::Bold),
+            "consolai" | "couri" => Some(Self::Italic),
+            "consolaz" | "courbi" => Some(Self::BoldItalic),
+            _ => None,
+        };
+        if let Some(kind) = abbreviated {
+            return self == kind;
+        }
         self.style_matches(file_name)
     }
 }
@@ -255,7 +275,10 @@ fn font_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     #[cfg(windows)]
     {
-        if let Ok(windir) = std::env::var("WINDIR") {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local_app_data).join("Microsoft/Windows/Fonts"));
+        }
+        if let Some(windir) = std::env::var_os("WINDIR") {
             dirs.push(PathBuf::from(windir).join("Fonts"));
         }
         dirs.push(PathBuf::from(r"C:\Windows\Fonts"));
@@ -310,4 +333,45 @@ fn walk(dir: &Path, needles: &[String], kind: FaceKind, depth: u8) -> Option<Pat
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abbreviated_windows_faces_do_not_match_other_styles() {
+        let faces = [
+            (FaceKind::Regular, ["consola.ttf", "cour.ttf"]),
+            (FaceKind::Bold, ["consolab.ttf", "courbd.ttf"]),
+            (FaceKind::Italic, ["consolai.ttf", "couri.ttf"]),
+            (FaceKind::BoldItalic, ["consolaz.ttf", "courbi.ttf"]),
+        ];
+        for (expected, names) in faces {
+            for name in names {
+                for kind in [
+                    FaceKind::Regular,
+                    FaceKind::Bold,
+                    FaceKind::Italic,
+                    FaceKind::BoldItalic,
+                ] {
+                    assert_eq!(kind.filename_matches(name), kind == expected, "{name}");
+                    assert_eq!(
+                        kind.filename_matches(&name.to_uppercase()),
+                        kind == expected,
+                        "{name} (uppercase)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn descriptive_font_style_names_still_match() {
+        assert!(FaceKind::Regular.filename_matches("JetBrainsMono-Regular.ttf"));
+        assert!(FaceKind::Bold.filename_matches("JetBrainsMono-Bold.ttf"));
+        assert!(FaceKind::Italic.filename_matches("JetBrainsMono-Italic.ttf"));
+        assert!(FaceKind::BoldItalic.filename_matches("JetBrainsMono-BoldItalic.ttf"));
+        assert!(!FaceKind::Regular.filename_matches("JetBrainsMono-Bold.ttf"));
+    }
 }
