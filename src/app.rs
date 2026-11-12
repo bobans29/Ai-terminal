@@ -18,7 +18,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Theme, Window, WindowId};
 
-use crate::config::Config;
+use crate::config::{Config, Profile};
 use crate::font::FontSet;
 use crate::input::{self, KeyAction};
 use crate::layout::{Axis, Layout, Rect};
@@ -37,6 +37,8 @@ enum UserEvent {
 
 struct Pane {
     id: u64,
+    profile: Profile,
+    font: usize,
     rect: Rect,
     terminal: Terminal,
     pty: PtySession,
@@ -80,6 +82,7 @@ impl Composition {
 
 struct App {
     config: Config,
+    selected_profile: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -123,8 +126,10 @@ pub fn run(config: Config) -> Result<(), String> {
 
 impl App {
     fn new(config: Config, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let selected_profile = config.default_profile.clone();
         Self {
             config,
+            selected_profile,
             proxy,
             window: None,
             renderer: None,
@@ -219,27 +224,69 @@ impl App {
     }
 
     fn leaf_minimum(&self) -> (u32, u32) {
-        let (cw, ch) = self
-            .renderer
-            .as_ref()
-            .map(Renderer::cell_size)
-            .unwrap_or((8.0, 16.0));
-        ((cw * 4.0).ceil() as u32, (ch * 2.0).ceil() as u32)
+        let Some(renderer) = self.renderer.as_ref() else {
+            return (32, 32);
+        };
+        let mut size = (0.0f32, 0.0f32);
+        if let Some(tab) = self.tabs.get(self.active) {
+            for pane in &tab.panes {
+                let (cw, ch) = renderer.cell_size_for(pane.font);
+                size.0 = size.0.max(cw);
+                size.1 = size.1.max(ch);
+            }
+        }
+        ((size.0 * 4.0).ceil() as u32, (size.1 * 2.0).ceil() as u32)
     }
 
-    fn spawn_pane(&mut self, rect: Rect) -> Result<Pane, String> {
+    fn selected_settings(&mut self) -> Result<(Profile, usize), String> {
+        let profile = self.config.profile(self.selected_profile.as_deref())?;
+        let font = self
+            .renderer
+            .as_mut()
+            .ok_or("renderer not initialized")?
+            .font_id(&profile.font_family, profile.font_size)?;
+        Ok((profile, font))
+    }
+
+    fn profile_label(&self) -> Option<String> {
+        if self.config.profiles.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "New: {}",
+            self.selected_profile.as_deref().unwrap_or("(global)")
+        ))
+    }
+
+    fn cycle_profile(&mut self) {
+        if self.config.profiles.is_empty() {
+            return;
+        }
+        let choices: Vec<Option<String>> = std::iter::once(None)
+            .chain(self.config.profiles.keys().cloned().map(Some))
+            .collect();
+        let current = choices
+            .iter()
+            .position(|name| name == &self.selected_profile)
+            .unwrap_or(0);
+        self.selected_profile = choices[(current + 1) % choices.len()].clone();
+        self.request_redraw();
+    }
+
+    fn spawn_pane(&mut self, rect: Rect, profile: Profile, font: usize) -> Result<Pane, String> {
         let (cw, ch) = self
             .renderer
             .as_ref()
             .ok_or("renderer not initialized")?
-            .cell_size();
+            .cell_size_for(font);
         let cols = grid_dim(rect.width, cw, 2);
         let rows = grid_dim(rect.height, ch, 1);
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         let proxy = self.proxy.clone();
         let pty = PtySession::spawn(
-            self.config.shell.as_deref(),
+            profile.shell.as_deref(),
+            profile.cwd.as_deref(),
             cols as u16,
             rows as u16,
             rect.width.min(u16::MAX as u32) as u16,
@@ -255,7 +302,9 @@ impl App {
         Ok(Pane {
             id,
             rect,
-            terminal: Terminal::new(cols, rows, self.config.scrollback),
+            terminal: Terminal::new(cols, rows, profile.scrollback),
+            profile,
+            font,
             pty,
             title: "aiterm".to_string(),
         })
@@ -263,7 +312,8 @@ impl App {
 
     fn new_tab(&mut self) -> Result<(), String> {
         let rect = self.content_bounds().ok_or("window not initialized")?;
-        let pane = self.spawn_pane(rect)?;
+        let (profile, font) = self.selected_settings()?;
+        let pane = self.spawn_pane(rect, profile, font)?;
         let id = pane.id;
         self.tabs.push(Tab {
             panes: vec![pane],
@@ -275,10 +325,18 @@ impl App {
     }
 
     fn split_pane(&mut self, axis: Axis) -> Result<(), String> {
+        let (profile, font) = self.selected_settings()?;
         let pane = self.pane().ok_or("no focused pane")?;
         let rect = pane.rect;
         let old_id = pane.id;
         let (min_w, min_h) = self.leaf_minimum();
+        let (cw, ch) = self
+            .renderer
+            .as_ref()
+            .ok_or("renderer not initialized")?
+            .cell_size_for(font);
+        let min_w = min_w.max((cw * 4.0).ceil() as u32);
+        let min_h = min_h.max((ch * 2.0).ceil() as u32);
         if rect.width < min_w || rect.height < min_h {
             return Err("pane too small to split".into());
         }
@@ -303,7 +361,7 @@ impl App {
         }
         // Spawn before changing the tree so an invalid shell leaves the old
         // layout and focused session intact.
-        let pane = self.spawn_pane(new_rect)?;
+        let pane = self.spawn_pane(new_rect, profile, font)?;
         let tab = &mut self.tabs[self.active];
         if !tab.layout.split(old_id, pane.id, axis) {
             return Err("focused pane missing from layout".into());
@@ -466,6 +524,7 @@ impl App {
             .iter()
             .map(|tab| tab.title().to_string())
             .collect();
+        let profile_label = self.profile_label();
         let retry = match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) => {
                 let panes: Vec<PanePaint<'_>> = tab
@@ -474,6 +533,8 @@ impl App {
                     .enumerate()
                     .map(|(i, pane)| PanePaint {
                         terminal: &pane.terminal,
+                        font: pane.font,
+                        palette: &pane.profile.palette,
                         rect: pane.rect,
                         cursor: if i == tab.active_pane {
                             paint
@@ -486,7 +547,13 @@ impl App {
                     })
                     .collect();
                 matches!(
-                    renderer.draw(&panes, &self.config.palette, &titles, self.active),
+                    renderer.draw(
+                        &panes,
+                        &self.config.palette,
+                        &titles,
+                        self.active,
+                        profile_label.as_deref()
+                    ),
                     DrawResult::Retry
                 )
             }
@@ -505,9 +572,9 @@ impl App {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.resize(size.width, size.height);
         }
-        let Some((cw, ch)) = self.renderer.as_ref().map(Renderer::cell_size) else {
+        if self.renderer.is_none() {
             return;
-        };
+        }
         if size.width == 0 || size.height == 0 {
             return;
         }
@@ -519,6 +586,11 @@ impl App {
                 let Some(pane) = tab.panes.iter_mut().find(|pane| pane.id == id) else {
                     continue;
                 };
+                let (cw, ch) = self
+                    .renderer
+                    .as_ref()
+                    .expect("renderer checked above")
+                    .cell_size_for(pane.font);
                 let cols = grid_dim(rect.width, cw, 2);
                 let rows = grid_dim(rect.height, ch, 1);
                 let changed = pane.rect != rect
@@ -591,10 +663,11 @@ impl App {
                     }
                 }
                 Event::ColorRequest(index_color, format) => {
-                    let rgb = self
-                        .config
+                    let pane = &self.tabs[ti].panes[pi];
+                    let rgb = pane
+                        .profile
                         .palette
-                        .dynamic(self.tabs[ti].panes[pi].terminal.colors(), index_color);
+                        .dynamic(pane.terminal.colors(), index_color);
                     self.write_pty_to(id, format(rgb.to_vte()).as_bytes());
                 }
                 Event::TextAreaSizeRequest(format) => {
@@ -602,7 +675,7 @@ impl App {
                     let (cell_w, cell_h) = self
                         .renderer
                         .as_ref()
-                        .map(Renderer::cell_size)
+                        .map(|renderer| renderer.cell_size_for(self.tabs[ti].panes[pi].font))
                         .unwrap_or((8.0, 16.0));
                     self.write_pty_to(
                         id,
@@ -703,6 +776,7 @@ impl App {
                     self.close_pane(id);
                 }
             }
+            KeyAction::CycleProfile => self.cycle_profile(),
             KeyAction::None => {}
         }
     }
@@ -765,7 +839,7 @@ impl App {
     }
 
     fn cell_at(&self) -> Option<(usize, usize, Side)> {
-        let (cell_w, cell_h) = self.renderer.as_ref()?.cell_size();
+        let (cell_w, cell_h) = self.renderer.as_ref()?.cell_size_for(self.pane()?.font);
         let cols = self.terminal()?.cols();
         let rows = self.terminal()?.rows();
         if cell_w < 1.0 || cell_h < 1.0 || cols == 0 || rows == 0 {
@@ -861,7 +935,21 @@ impl App {
                     .as_ref()
                     .map(|r| r.cell_size().0)
                     .unwrap_or(8.0);
-                match crate::tab_bar::hit(self.pointer.x as f32, width, cell_w, self.tabs.len()) {
+                let badge = if self.config.profiles.is_empty() {
+                    0.0
+                } else {
+                    crate::tab_bar::profile_width(width, cell_w)
+                };
+                if self.pointer.x >= f64::from(width - badge) && badge > 0.0 {
+                    self.cycle_profile();
+                    return;
+                }
+                match crate::tab_bar::hit(
+                    self.pointer.x as f32,
+                    width - badge,
+                    cell_w,
+                    self.tabs.len(),
+                ) {
                     Some(crate::tab_bar::Hit::Select(index)) => self.switch_tab(index),
                     Some(crate::tab_bar::Hit::Close(index)) => self.close_tab(index),
                     Some(crate::tab_bar::Hit::New) => {
@@ -1011,7 +1099,7 @@ impl App {
         let cell_h = self
             .renderer
             .as_ref()
-            .map(|renderer| renderer.cell_size().1)
+            .and_then(|renderer| self.pane().map(|pane| renderer.cell_size_for(pane.font).1))
             .unwrap_or(16.0);
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, y) => input::notch_to_lines(y),

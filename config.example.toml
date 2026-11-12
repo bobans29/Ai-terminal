@@ -30,3 +30,13 @@ bright_blue = "#89b4fa"
 bright_magenta = "#f5c2e7"
 bright_cyan = "#94e2d5"
 bright_white = "#a6adc8"
+
+# Profiles override global settings. Missing values inherit from the global
+# settings, not from another profile. Uncomment cwd to select a directory.
+[profiles.large]
+font_size = 18.0
+# cwd = 'C:\Users\me\work'
+
+# Profile palettes are partial; unspecified colors use the global palette.
+[profiles.large.colors]
+background = "#11111b"

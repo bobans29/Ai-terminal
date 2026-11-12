@@ -12,6 +12,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 pub enum KeyAction {
     Bytes(Vec<u8>),
     Scroll(Scroll),
+    CycleProfile,
     NewTab,
     CloseTab,
     NextTab,
@@ -29,6 +30,16 @@ pub enum KeyAction {
 pub fn encode_key(key: &Key, mods: ModifiersState, mode: TermMode) -> KeyAction {
     if let Some(action) = pane_action(key, mods) {
         return action;
+    }
+    if let Key::Character(text) = key {
+        if text.eq_ignore_ascii_case("p")
+            && mods.control_key()
+            && mods.shift_key()
+            && !mods.alt_key()
+            && !mods.super_key()
+        {
+            return KeyAction::CycleProfile;
+        }
     }
     if let Some(action) = tab_action(key, mods) {
         return action;
@@ -551,6 +562,26 @@ mod tests {
                 TermMode::empty()
             ),
             b"\x1b[C"
+        );
+    }
+
+    #[test]
+    fn profile_shortcut_preserves_plain_ctrl_p() {
+        assert!(matches!(
+            encode_key(
+                &Key::Character("P".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                TermMode::empty()
+            ),
+            KeyAction::CycleProfile
+        ));
+        assert_eq!(
+            bytes(
+                Key::Character("p".into()),
+                ModifiersState::CONTROL,
+                TermMode::empty()
+            ),
+            vec![0x10]
         );
     }
 

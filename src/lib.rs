@@ -22,10 +22,27 @@ mod renderer;
 mod tab_bar;
 mod terminal;
 
-pub use config::Config;
+pub use config::{Config, Profile};
 
 /// Open the window and run until it closes.
 pub fn run(config_path: Option<std::path::PathBuf>) -> Result<(), String> {
+    run_with_profile(config_path, None)
+}
+
+/// Open the window and run until it closes, optionally overriding the configured profile.
+pub fn run_with_profile(
+    config_path: Option<std::path::PathBuf>,
+    profile: Option<String>,
+) -> Result<(), String> {
     let config = Config::load(config_path)?;
+    let config = if let Some(name) = profile {
+        config.profile(Some(&name))?;
+        Config {
+            default_profile: Some(name),
+            ..config
+        }
+    } else {
+        config
+    };
     app::run(config)
 }
