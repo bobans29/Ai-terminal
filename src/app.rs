@@ -2,7 +2,7 @@
 //!
 //! winit owns the frame. This module turns key and mouse events into PTY
 //! bytes and asks the renderer to paint the grid. Tabs, splits, and an agent
-//! sidebar would live here; they should not leak into [`crate::terminal`] or
+//! sidebar live here; they should not leak into [`crate::terminal`] or
 //! [`crate::pty`].
 
 use std::sync::Arc;
@@ -29,8 +29,38 @@ use crate::terminal::Terminal;
 const BLINK: Duration = Duration::from_millis(530);
 
 enum UserEvent {
-    Pty(Vec<u8>),
-    Closed,
+    Pty(u64, Vec<u8>),
+    Closed(u64),
+}
+
+struct Tab {
+    id: u64,
+    terminal: Terminal,
+    pty: PtySession,
+    title: String,
+}
+
+#[derive(Default)]
+struct Composition {
+    preediting: bool,
+    tab: Option<u64>,
+}
+
+impl Composition {
+    fn preedit(&mut self, text: &str, active: Option<u64>) {
+        if !text.is_empty() && !self.preediting {
+            self.tab = active;
+        }
+        // Empty preedit can precede Commit, so retain the source until commit
+        // or the beginning of a fresh composition after cancellation.
+        self.preediting = !text.is_empty();
+    }
+
+    fn commit(&mut self, active: Option<u64>) -> bool {
+        self.preediting = false;
+        let owner = self.tab.take();
+        owner.is_none() || owner == active
+    }
 }
 
 struct App {
@@ -38,8 +68,9 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    terminal: Option<Terminal>,
-    pty: Option<PtySession>,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
     modifiers: ModifiersState,
     pointer: PhysicalPosition<f64>,
     selecting: bool,
@@ -47,7 +78,7 @@ struct App {
     mouse_buttons: u8,
     /// Unused pixel movement from touchpad scrolling.
     pixel_scroll: f32,
-    composing: bool,
+    composition: Composition,
     focused: bool,
     cursor_on: bool,
     next_blink: Instant,
@@ -81,14 +112,15 @@ impl App {
             proxy,
             window: None,
             renderer: None,
-            terminal: None,
-            pty: None,
+            tabs: Vec::new(),
+            active: 0,
+            next_tab_id: 0,
             modifiers: ModifiersState::empty(),
             pointer: PhysicalPosition::new(0.0, 0.0),
             selecting: false,
             mouse_buttons: 0,
             pixel_scroll: 0.0,
-            composing: false,
+            composition: Composition::default(),
             focused: true,
             cursor_on: true,
             next_blink: Instant::now() + BLINK,
@@ -120,33 +152,107 @@ impl App {
             self.config.font_size,
             self.config.palette.background,
         )?;
-        let (cell_w, cell_h) = renderer.cell_size();
-        let size = window.inner_size();
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.new_tab()?;
+        self.request_redraw();
+        Ok(())
+    }
+
+    fn terminal(&self) -> Option<&Terminal> {
+        self.tabs.get(self.active).map(|tab| &tab.terminal)
+    }
+
+    fn terminal_mut(&mut self) -> Option<&mut Terminal> {
+        self.tabs.get_mut(self.active).map(|tab| &mut tab.terminal)
+    }
+
+    fn new_tab(&mut self) -> Result<(), String> {
+        let size = self
+            .window
+            .as_ref()
+            .ok_or("window not initialized")?
+            .inner_size();
+        let (cell_w, cell_h) = self
+            .renderer
+            .as_ref()
+            .ok_or("renderer not initialized")?
+            .cell_size();
+        let height = size.height.saturating_sub(cell_h as u32);
         let cols = grid_dim(size.width, cell_w, 2);
-        let rows = grid_dim(size.height, cell_h, 1);
-        let terminal = Terminal::new(cols, rows, self.config.scrollback);
-        let shell = self.config.shell.clone();
+        let rows = grid_dim(height, cell_h, 1);
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
         let proxy = self.proxy.clone();
         let pty = PtySession::spawn(
-            shell.as_deref(),
+            self.config.shell.as_deref(),
             cols as u16,
             rows as u16,
             size.width.min(u16::MAX as u32) as u16,
-            size.height.min(u16::MAX as u32) as u16,
+            height.min(u16::MAX as u32) as u16,
             move |msg| {
                 let event = match msg {
-                    PtyMsg::Data(bytes) => UserEvent::Pty(bytes),
-                    PtyMsg::Closed => UserEvent::Closed,
+                    PtyMsg::Data(bytes) => UserEvent::Pty(id, bytes),
+                    PtyMsg::Closed => UserEvent::Closed(id),
                 };
                 let _ = proxy.send_event(event);
             },
         )?;
-        self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.terminal = Some(terminal);
-        self.pty = Some(pty);
-        self.request_redraw();
+        self.tabs.push(Tab {
+            id,
+            terminal: Terminal::new(cols, rows, self.config.scrollback),
+            pty,
+            title: "aiterm".to_string(),
+        });
+        self.switch_tab(self.tabs.len() - 1);
         Ok(())
+    }
+
+    fn report_focus(&mut self, focused: bool) {
+        if self
+            .terminal()
+            .is_some_and(|term| term.mode().contains(TermMode::FOCUS_IN_OUT))
+        {
+            self.write_pty(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        }
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if index != self.active {
+            self.release_mouse();
+            self.report_focus(false);
+            self.active = index;
+            self.report_focus(self.focused);
+        }
+        self.selecting = false;
+        self.mouse_buttons = 0;
+        self.pixel_scroll = 0.0;
+        self.wake_cursor();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let was_active = index == self.active;
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.close = true;
+            return;
+        }
+        if index < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
+        if was_active {
+            self.report_focus(self.focused);
+        }
+        self.switch_tab(self.active);
     }
 
     fn request_redraw(&self) {
@@ -157,8 +263,7 @@ impl App {
 
     fn cursor_paint(&self) -> CursorPaint {
         let visible = self
-            .terminal
-            .as_ref()
+            .terminal()
             .map(|term| term.mode().contains(TermMode::SHOW_CURSOR))
             .unwrap_or(false);
         if !visible {
@@ -175,8 +280,7 @@ impl App {
     fn should_blink(&self) -> bool {
         self.focused
             && self
-                .terminal
-                .as_ref()
+                .terminal()
                 .map(|term| term.mode().contains(TermMode::SHOW_CURSOR))
                 .unwrap_or(false)
     }
@@ -188,10 +292,17 @@ impl App {
 
     fn redraw(&mut self) {
         let paint = self.cursor_paint();
-        let retry = match (self.renderer.as_mut(), self.terminal.as_ref()) {
-            (Some(renderer), Some(terminal)) => {
+        let titles: Vec<String> = self.tabs.iter().map(|tab| tab.title.clone()).collect();
+        let retry = match (self.renderer.as_mut(), self.tabs.get(self.active)) {
+            (Some(renderer), Some(tab)) => {
                 matches!(
-                    renderer.draw(terminal, &self.config.palette, paint),
+                    renderer.draw(
+                        &tab.terminal,
+                        &self.config.palette,
+                        paint,
+                        &titles,
+                        self.active
+                    ),
                     DrawResult::Retry
                 )
             }
@@ -217,25 +328,17 @@ impl App {
             return;
         }
         let cols = grid_dim(size.width, cell_w, 2);
-        let rows = grid_dim(size.height, cell_h, 1);
-        let changed = self
-            .terminal
-            .as_ref()
-            .map(|term| term.cols() != cols || term.rows() != rows)
-            .unwrap_or(true);
-        if let Some(terminal) = self.terminal.as_mut() {
-            terminal.resize(cols, rows);
-        }
-        if changed {
-            if let Some(pty) = self.pty.as_ref() {
-                if let Err(err) = pty.resize(
-                    cols as u16,
-                    rows as u16,
-                    size.width.min(u16::MAX as u32) as u16,
-                    size.height.min(u16::MAX as u32) as u16,
-                ) {
-                    eprintln!("aiterm: {err}");
-                }
+        let height = size.height.saturating_sub(cell_h as u32);
+        let rows = grid_dim(height, cell_h, 1);
+        for tab in &mut self.tabs {
+            tab.terminal.resize(cols, rows);
+            if let Err(err) = tab.pty.resize(
+                cols as u16,
+                rows as u16,
+                size.width.min(u16::MAX as u32) as u16,
+                height.min(u16::MAX as u32) as u16,
+            ) {
+                eprintln!("aiterm: {err}");
             }
         }
         self.request_redraw();
@@ -253,73 +356,77 @@ impl App {
         }
     }
 
-    fn on_pty(&mut self, bytes: Vec<u8>) {
-        let events = match self.terminal.as_mut() {
-            Some(terminal) => terminal.process(&bytes),
-            None => return,
+    fn on_pty(&mut self, id: u64, bytes: Vec<u8>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return; // A queued message can outlive its closed tab.
         };
-        self.handle_events(events);
+        let events = tab.terminal.process(&bytes);
+        self.handle_events_for(id, events);
         self.request_redraw();
     }
 
     fn handle_events(&mut self, events: Vec<Event>) {
+        if let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) {
+            self.handle_events_for(id, events);
+        }
+    }
+
+    fn handle_events_for(&mut self, id: u64, events: Vec<Event>) {
         for event in events {
+            // Process replies for the source tab, including background tabs.
+            let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+                return;
+            };
             match event {
-                Event::Title(title) => self.set_title(title),
-                Event::ResetTitle => self.set_title("aiterm".to_string()),
-                Event::PtyWrite(data) => self.write_pty(data.as_bytes()),
+                Event::Title(title) => {
+                    self.tabs[index].title = title;
+                    self.update_title();
+                }
+                Event::ResetTitle => {
+                    self.tabs[index].title = "aiterm".to_string();
+                    self.update_title();
+                }
+                Event::PtyWrite(data) => self.write_pty_to(id, data.as_bytes()),
                 Event::ClipboardStore(_, text) => self.clipboard_set(&text),
                 Event::ClipboardLoad(_, format) => {
                     if let Some(text) = self.clipboard_get() {
-                        let reply = format(&text);
-                        self.write_pty(reply.as_bytes());
+                        self.write_pty_to(id, format(&text).as_bytes());
                     }
                 }
-                Event::ColorRequest(index, format) => {
-                    let rgb = match self.terminal.as_ref() {
-                        Some(terminal) => self.config.palette.dynamic(terminal.colors(), index),
-                        None => self.config.palette.foreground,
-                    };
-                    let reply = format(rgb.to_vte());
-                    self.write_pty(reply.as_bytes());
+                Event::ColorRequest(index_color, format) => {
+                    let rgb = self
+                        .config
+                        .palette
+                        .dynamic(self.tabs[index].terminal.colors(), index_color);
+                    self.write_pty_to(id, format(rgb.to_vte()).as_bytes());
                 }
                 Event::TextAreaSizeRequest(format) => {
-                    let (cols, rows, cell_w, cell_h) = self.area_size();
-                    let reply = format(WindowSize {
-                        num_cols: cols,
-                        num_lines: rows,
-                        cell_width: cell_w,
-                        cell_height: cell_h,
-                    });
-                    self.write_pty(reply.as_bytes());
+                    let term = &self.tabs[index].terminal;
+                    let (cell_w, cell_h) = self
+                        .renderer
+                        .as_ref()
+                        .map(Renderer::cell_size)
+                        .unwrap_or((8.0, 16.0));
+                    self.write_pty_to(
+                        id,
+                        format(WindowSize {
+                            num_cols: term.cols() as u16,
+                            num_lines: term.rows() as u16,
+                            cell_width: cell_w as u16,
+                            cell_height: cell_h as u16,
+                        })
+                        .as_bytes(),
+                    );
                 }
-                Event::Exit => self.close = true,
-                Event::Bell
-                | Event::Wakeup
-                | Event::MouseCursorDirty
-                | Event::CursorBlinkingChange
-                | Event::ChildExit(_) => {}
+                Event::Exit => self.close_tab(index),
+                _ => {}
             }
         }
     }
 
-    fn area_size(&self) -> (u16, u16, u16, u16) {
-        let (cols, rows) = self
-            .terminal
-            .as_ref()
-            .map(|term| (term.cols(), term.rows()))
-            .unwrap_or((80, 24));
-        let (cell_w, cell_h) = self
-            .renderer
-            .as_ref()
-            .map(Renderer::cell_size)
-            .unwrap_or((8.0, 16.0));
-        (cols as u16, rows as u16, cell_w as u16, cell_h as u16)
-    }
-
-    fn set_title(&self, title: String) {
-        if let Some(window) = &self.window {
-            window.set_title(&title);
+    fn update_title(&self) {
+        if let (Some(window), Some(tab)) = (&self.window, self.tabs.get(self.active)) {
+            window.set_title(&tab.title);
         }
     }
 
@@ -327,7 +434,7 @@ impl App {
         if bytes.is_empty() {
             return;
         }
-        let events = match self.terminal.as_mut() {
+        let events = match self.terminal_mut() {
             Some(terminal) => terminal.scroll_to_bottom(),
             None => Vec::new(),
         };
@@ -337,19 +444,26 @@ impl App {
     }
 
     fn write_pty(&mut self, bytes: &[u8]) {
+        if let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) {
+            self.write_pty_to(id, bytes);
+        }
+    }
+
+    fn write_pty_to(&mut self, id: u64, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        if let Some(pty) = self.pty.as_mut() {
-            if let Err(err) = pty.write(bytes) {
-                eprintln!("aiterm: {err}");
-                self.close = true;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            if let Err(err) = tab.pty.write(bytes) {
+                // Reader EOF owns session removal; a failed background reply
+                // must never close the active tab or the whole window.
+                eprintln!("aiterm: tab {id}: {err}");
             }
         }
     }
 
     fn on_key(&mut self, key: &Key) {
-        let mode = match self.terminal.as_ref() {
+        let mode = match self.terminal() {
             Some(terminal) => terminal.mode(),
             None => return,
         };
@@ -365,12 +479,22 @@ impl App {
             KeyAction::Scroll(scroll) => self.scroll(scroll),
             KeyAction::Copy => self.copy_selection(),
             KeyAction::Paste => self.paste(),
+            KeyAction::NewTab => {
+                if let Err(err) = self.new_tab() {
+                    eprintln!("aiterm: {err}");
+                }
+            }
+            KeyAction::CloseTab => self.close_tab(self.active),
+            KeyAction::NextTab => self.switch_tab((self.active + 1) % self.tabs.len()),
+            KeyAction::PreviousTab => {
+                self.switch_tab((self.active + self.tabs.len() - 1) % self.tabs.len())
+            }
             KeyAction::None => {}
         }
     }
 
     fn scroll(&mut self, scroll: Scroll) {
-        let events = match self.terminal.as_mut() {
+        let events = match self.terminal_mut() {
             Some(terminal) => terminal.scroll(scroll),
             None => return,
         };
@@ -379,13 +503,13 @@ impl App {
     }
 
     fn clear_selection(&mut self) {
-        if let Some(terminal) = self.terminal.as_mut() {
+        if let Some(terminal) = self.terminal_mut() {
             terminal.clear_selection();
         }
     }
 
     fn copy_selection(&mut self) {
-        if let Some(text) = self.terminal.as_ref().and_then(Terminal::selection_text) {
+        if let Some(text) = self.terminal().and_then(Terminal::selection_text) {
             self.clipboard_set(&text);
         }
     }
@@ -396,8 +520,7 @@ impl App {
         };
         let normalized = input::sanitize_paste(&text);
         let mode = self
-            .terminal
-            .as_ref()
+            .terminal()
             .map(Terminal::mode)
             .unwrap_or_else(TermMode::empty);
         let bytes = if mode.contains(TermMode::BRACKETED_PASTE) {
@@ -413,8 +536,7 @@ impl App {
         self.focused = focused;
         self.wake_cursor();
         let report = self
-            .terminal
-            .as_ref()
+            .terminal()
             .map(|term| term.mode().contains(TermMode::FOCUS_IN_OUT))
             .unwrap_or(false);
         if report {
@@ -426,13 +548,13 @@ impl App {
 
     fn cell_at(&self) -> Option<(usize, usize, Side)> {
         let (cell_w, cell_h) = self.renderer.as_ref()?.cell_size();
-        let cols = self.terminal.as_ref()?.cols();
-        let rows = self.terminal.as_ref()?.rows();
+        let cols = self.terminal()?.cols();
+        let rows = self.terminal()?.rows();
         if cell_w < 1.0 || cell_h < 1.0 || cols == 0 || rows == 0 {
             return None;
         }
         let mut col = (self.pointer.x / f64::from(cell_w)).floor() as isize;
-        let mut row = (self.pointer.y / f64::from(cell_h)).floor() as isize;
+        let mut row = ((self.pointer.y - f64::from(cell_h)) / f64::from(cell_h)).floor() as isize;
         let past_right = col >= cols as isize;
         let past_left = col < 0;
         col = col.clamp(0, cols as isize - 1);
@@ -452,9 +574,26 @@ impl App {
         Some((col as usize, row as usize, side))
     }
 
-    fn mouse_mode(&self) -> bool {
-        self.terminal
+    fn over_tab_bar(&self) -> bool {
+        self.renderer
             .as_ref()
+            .is_some_and(|renderer| self.pointer.y < f64::from(renderer.cell_size().1))
+    }
+
+    fn release_mouse(&mut self) {
+        if self.mouse_mode() && !self.modifiers.shift_key() {
+            for code in 0..3 {
+                if self.mouse_buttons & (1 << code) != 0 {
+                    self.send_mouse(code, false);
+                }
+            }
+        }
+        self.mouse_buttons = 0;
+        self.selecting = false;
+    }
+
+    fn mouse_mode(&self) -> bool {
+        self.terminal()
             .map(|term| term.mode().intersects(TermMode::MOUSE_MODE))
             .unwrap_or(false)
     }
@@ -486,6 +625,48 @@ impl App {
 
     fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         let pressed = state == ElementState::Pressed;
+        if self.over_tab_bar() {
+            if pressed && button == MouseButton::Left {
+                let width = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.inner_size().width as f32)
+                    .unwrap_or(0.0);
+                let cell_w = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.cell_size().0)
+                    .unwrap_or(8.0);
+                match crate::tab_bar::hit(self.pointer.x as f32, width, cell_w, self.tabs.len()) {
+                    Some(crate::tab_bar::Hit::Select(index)) => self.switch_tab(index),
+                    Some(crate::tab_bar::Hit::Close(index)) => self.close_tab(index),
+                    Some(crate::tab_bar::Hit::New) => {
+                        if let Err(err) = self.new_tab() {
+                            eprintln!("aiterm: {err}");
+                        }
+                    }
+                    None => {}
+                }
+            }
+            if !pressed {
+                // Complete a drag which began in the terminal, clamped to its
+                // top row. Header clicks never set terminal button bits.
+                if let Some(code) = input::mouse_button_code(button) {
+                    if self.mouse_buttons & (1 << code) != 0
+                        && self.mouse_mode()
+                        && !self.modifiers.shift_key()
+                    {
+                        self.send_mouse(code, false);
+                    }
+                }
+                if self.selecting {
+                    self.copy_selection();
+                }
+                self.selecting = false;
+                self.note_button(button, false);
+            }
+            return;
+        }
         if pressed {
             self.note_button(button, true);
         }
@@ -508,17 +689,17 @@ impl App {
         if state == ElementState::Pressed {
             self.selecting = true;
             if let Some((col, row, side)) = self.cell_at() {
-                if let Some(terminal) = self.terminal.as_mut() {
+                if let Some(terminal) = self.terminal_mut() {
                     terminal.start_selection(col, row, side);
                 }
             }
             self.request_redraw();
         } else {
             self.selecting = false;
-            let text = self.terminal.as_ref().and_then(Terminal::selection_text);
+            let text = self.terminal().and_then(Terminal::selection_text);
             if let Some(text) = text {
                 self.clipboard_set(&text);
-            } else if let Some(terminal) = self.terminal.as_mut() {
+            } else if let Some(terminal) = self.terminal_mut() {
                 terminal.clear_selection();
                 self.request_redraw();
             }
@@ -529,15 +710,15 @@ impl App {
         self.pointer = position;
         if self.selecting {
             if let Some((col, row, side)) = self.cell_at() {
-                if let Some(terminal) = self.terminal.as_mut() {
+                if let Some(terminal) = self.terminal_mut() {
                     terminal.update_selection(col, row, side);
                 }
             }
             self.request_redraw();
             return;
         }
-        if self.mouse_mode() && !self.modifiers.shift_key() {
-            let mode = match self.terminal.as_ref() {
+        if !self.over_tab_bar() && self.mouse_mode() && !self.modifiers.shift_key() {
+            let mode = match self.terminal() {
                 Some(terminal) => terminal.mode(),
                 None => return,
             };
@@ -555,6 +736,9 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
+        if self.over_tab_bar() {
+            return;
+        }
         let cell_h = self
             .renderer
             .as_ref()
@@ -569,7 +753,7 @@ impl App {
         if lines == 0 {
             return;
         }
-        let mode = match self.terminal.as_ref() {
+        let mode = match self.terminal() {
             Some(terminal) => terminal.mode(),
             None => return,
         };
@@ -602,7 +786,7 @@ impl App {
         let Some((col, row, _)) = self.cell_at() else {
             return;
         };
-        let mode = match self.terminal.as_ref() {
+        let mode = match self.terminal() {
             Some(terminal) => terminal.mode(),
             None => return,
         };
@@ -683,11 +867,16 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Pty(bytes) => self.on_pty(bytes),
-            UserEvent::Closed => {
-                eprintln!("aiterm: shell exited");
-                event_loop.exit();
+            UserEvent::Pty(id, bytes) => self.on_pty(id, bytes),
+            UserEvent::Closed(id) => {
+                if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
+                    eprintln!("aiterm: tab {id} shell exited");
+                    self.close_tab(index);
+                }
             }
+        }
+        if self.close {
+            event_loop.exit();
         }
     }
 
@@ -710,18 +899,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // While an IME composition is open, character keys belong to the
                 // IME. Escape, Enter, and Backspace still go to the shell.
-                if self.composing && !ime_bypass(&event.logical_key) {
+                if self.composition.preediting && !ime_bypass(&event.logical_key) {
                     return;
                 }
                 self.on_key(&event.logical_key);
             }
-            WindowEvent::Ime(Ime::Enabled) => self.composing = false,
-            WindowEvent::Ime(Ime::Disabled) => self.composing = false,
-            WindowEvent::Ime(Ime::Preedit(text, _)) => self.composing = !text.is_empty(),
+            WindowEvent::Ime(Ime::Enabled | Ime::Disabled) => {
+                self.composition = Composition::default();
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                self.composition
+                    .preedit(&text, self.tabs.get(self.active).map(|tab| tab.id));
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                self.composing = false;
-                self.wake_cursor();
-                self.write_input(text.as_bytes());
+                if self
+                    .composition
+                    .commit(self.tabs.get(self.active).map(|tab| tab.id))
+                {
+                    self.wake_cursor();
+                    self.write_input(text.as_bytes());
+                }
             }
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(position),
             WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(button, state),
@@ -749,5 +946,32 @@ impl ApplicationHandler<UserEvent> for App {
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Composition;
+
+    #[test]
+    fn composition_does_not_leak_after_tab_switch() {
+        let mut ime = Composition::default();
+        ime.preedit("composing", Some(1));
+        // Platforms can send an empty preedit immediately before commit.
+        ime.preedit("", Some(2));
+        assert!(!ime.commit(Some(2)));
+        assert!(!ime.preediting);
+        // Direct commits without a preedit remain supported.
+        assert!(ime.commit(Some(2)));
+    }
+
+    #[test]
+    fn fresh_composition_after_cancellation_belongs_to_current_tab() {
+        let mut ime = Composition::default();
+        ime.preedit("cancelled", Some(1));
+        ime.preedit("", Some(1));
+        ime.preedit("new input", Some(2));
+        ime.preedit("", Some(2));
+        assert!(ime.commit(Some(2)));
     }
 }

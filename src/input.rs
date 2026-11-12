@@ -12,12 +12,19 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 pub enum KeyAction {
     Bytes(Vec<u8>),
     Scroll(Scroll),
+    NewTab,
+    CloseTab,
+    NextTab,
+    PreviousTab,
     Copy,
     Paste,
     None,
 }
 
 pub fn encode_key(key: &Key, mods: ModifiersState, mode: TermMode) -> KeyAction {
+    if let Some(action) = tab_action(key, mods) {
+        return action;
+    }
     if is_copy(key, mods) {
         return KeyAction::Copy;
     }
@@ -46,6 +53,39 @@ pub fn encode_key(key: &Key, mods: ModifiersState, mode: TermMode) -> KeyAction 
         return character_bytes(text, mods);
     }
     KeyAction::None
+}
+
+fn tab_action(key: &Key, mods: ModifiersState) -> Option<KeyAction> {
+    if let Key::Named(NamedKey::Tab) = key {
+        if mods.control_key() && !mods.alt_key() && !mods.super_key() {
+            return Some(if mods.shift_key() {
+                KeyAction::PreviousTab
+            } else {
+                KeyAction::NextTab
+            });
+        }
+    }
+
+    let Key::Character(text) = key else {
+        return None;
+    };
+    if !text.eq_ignore_ascii_case("t") && !text.eq_ignore_ascii_case("w") {
+        return None;
+    }
+    let new_tab = text.eq_ignore_ascii_case("t");
+    let action = if new_tab {
+        KeyAction::NewTab
+    } else {
+        KeyAction::CloseTab
+    };
+    if mods.control_key() && mods.shift_key() && !mods.alt_key() && !mods.super_key() {
+        return Some(action);
+    }
+    #[cfg(target_os = "macos")]
+    if mods.super_key() && !mods.control_key() && !mods.shift_key() && !mods.alt_key() {
+        return Some(action);
+    }
+    None
 }
 
 /// Wheel notches (positive = content moves down, revealing lines above).
@@ -181,9 +221,6 @@ fn named_bytes(key: &Key, mods: ModifiersState, mode: TermMode) -> Option<Vec<u8
         NamedKey::Tab => {
             if mods.shift_key() {
                 b"\x1b[Z".to_vec()
-            } else if mods.control_key() {
-                // Reserved for a future tab switcher.
-                return Some(Vec::new());
             } else {
                 vec![b'\t']
             }
@@ -370,6 +407,47 @@ mod tests {
                 TermMode::empty()
             ),
             b"\x1bx"
+        );
+    }
+
+    #[test]
+    fn tab_shortcuts_are_actions_and_plain_ctrl_letters_stay_shell_controls() {
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(matches!(
+            encode_key(&Key::Character("t".into()), ctrl_shift, TermMode::empty()),
+            KeyAction::NewTab
+        ));
+        assert!(matches!(
+            encode_key(&Key::Character("W".into()), ctrl_shift, TermMode::empty()),
+            KeyAction::CloseTab
+        ));
+        assert!(matches!(
+            encode_key(
+                &Key::Named(NamedKey::Tab),
+                ModifiersState::CONTROL,
+                TermMode::empty()
+            ),
+            KeyAction::NextTab
+        ));
+        assert!(matches!(
+            encode_key(&Key::Named(NamedKey::Tab), ctrl_shift, TermMode::empty()),
+            KeyAction::PreviousTab
+        ));
+        assert_eq!(
+            bytes(
+                Key::Character("t".into()),
+                ModifiersState::CONTROL,
+                TermMode::empty()
+            ),
+            vec![0x14]
+        );
+        assert_eq!(
+            bytes(
+                Key::Character("w".into()),
+                ModifiersState::CONTROL,
+                TermMode::empty()
+            ),
+            vec![0x17]
         );
     }
 

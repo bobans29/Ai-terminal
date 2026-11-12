@@ -1,15 +1,14 @@
-//! aiterm — Milestone 1 of a cross-platform GPU terminal.
+//! aiterm — a cross-platform GPU terminal with tabs.
 //!
-//! The process is one window and one shell. The modules below are the seams
-//! later milestones hang off:
+//! Each tab owns a terminal grid and PTY session. Tabs share one window,
+//! renderer device, and glyph atlas. The modules below divide those concerns:
 //!
-//! * [`terminal`] wraps the VT grid (one instance per pane, once tabs exist).
+//! * [`terminal`] wraps each tab's VT grid.
 //! * [`pty`] owns the PTY and the child. A headless/daemon mode can call it
 //!   without the window.
-//! * [`renderer`] turns a grid into a wgpu frame. Tabs would share the device
-//!   and the glyph atlas, not the grid.
-//! * [`app`] is the winit shell. The sidebar, tab strip, and agent status
-//!   belong here later, not inside the grid or the PTY.
+//! * [`renderer`] turns the active grid into a wgpu frame using the shared
+//!   device and glyph atlas.
+//! * [`app`] is the winit shell and owns tab selection and window input.
 
 mod app;
 mod color;
@@ -18,6 +17,7 @@ mod font;
 mod input;
 mod pty;
 mod renderer;
+mod tab_bar;
 mod terminal;
 
 pub use config::Config;

@@ -3,7 +3,7 @@
 //! A monospace grid is a list of colored rectangles plus a glyph atlas. wgpu
 //! draws both. The atlas is rasterized on the CPU with fontdue (one codepoint
 //! per cell, which matches how the terminal grid stores characters) and
-//! sampled on the GPU. Tabs later can share the device and the atlas.
+//! sampled on the GPU. Tabs share the device and the atlas.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use winit::window::Window;
 
 use crate::color::{self, Palette, Rgb};
 use crate::font::FontSet;
+use crate::tab_bar;
 use crate::terminal::Terminal;
 
 const ATLAS_START: u32 = 1024;
@@ -163,16 +164,18 @@ impl Renderer {
         terminal: &Terminal,
         palette: &Palette,
         cursor: CursorPaint,
+        titles: &[String],
+        active: usize,
     ) -> DrawResult {
         if self.config.width == 0 || self.config.height == 0 {
             return DrawResult::Ok;
         }
-        let mut verts = self.build_vertices(terminal, palette, cursor);
+        let mut verts = self.build_vertices(terminal, palette, cursor, titles, active);
         // Rasterizing a new glyph can grow the atlas. UVs baked above would
         // then be wrong, so build the frame once more against the final atlas.
         if self.atlas.grew {
             self.atlas.grew = false;
-            verts = self.build_vertices(terminal, palette, cursor);
+            verts = self.build_vertices(terminal, palette, cursor, titles, active);
             self.atlas.grew = false;
         }
         self.sync_atlas();
@@ -234,6 +237,8 @@ impl Renderer {
         terminal: &Terminal,
         palette: &Palette,
         cursor: CursorPaint,
+        titles: &[String],
+        active: usize,
     ) -> Vec<Vertex> {
         let mut verts = Vec::new();
         let width = self.config.width as f32;
@@ -258,7 +263,7 @@ impl Renderer {
                 continue;
             };
             let x = vp.column.0 as f32 * cell_w;
-            let y = vp.line as f32 * cell_h;
+            let y = cell_h + vp.line as f32 * cell_h;
             let flags = indexed.cell.flags;
             let mut fg = color::resolve(palette, colors, indexed.cell.fg);
             let mut bg = color::resolve(palette, colors, indexed.cell.bg);
@@ -414,7 +419,142 @@ impl Renderer {
         }
         verts.extend(backs);
         verts.extend(front);
+        self.build_tab_bar(&mut verts, palette, titles, active, width, height);
         verts
+    }
+
+    fn build_tab_bar(
+        &mut self,
+        verts: &mut Vec<Vertex>,
+        palette: &Palette,
+        titles: &[String],
+        active: usize,
+        width: f32,
+        height: f32,
+    ) {
+        let cell_w = self.fonts.cell_width;
+        let cell_h = self.fonts.cell_height;
+        let tab_w = tab_bar::tab_width(width, cell_w, titles.len());
+        let new_x = tab_bar::new_button_x(width, cell_w, titles.len());
+        let new_w = (width - new_x).min(3.0 * cell_w).max(0.0);
+
+        // Paint the opaque header after terminal glyphs so their overhangs do
+        // not bleed into the tab bar.
+        push_solid(
+            verts,
+            width,
+            height,
+            0.0,
+            0.0,
+            width,
+            cell_h,
+            palette.background,
+        );
+        for (i, title) in titles.iter().enumerate() {
+            let x = i as f32 * tab_w;
+            let bg = if i == active {
+                palette.selection
+            } else {
+                palette.background
+            };
+            push_solid(verts, width, height, x, 0.0, tab_w, cell_h, bg);
+            if tab_w <= 0.0 {
+                continue;
+            }
+
+            // Keep a full cell clear at either edge. A close affordance is
+            // only drawn when the shared hit geometry exposes its hit zone.
+            let has_close = tab_w >= 2.0 * cell_w;
+            let label_start = x + cell_w;
+            let label_end = x + tab_w - if has_close { 2.0 * cell_w } else { cell_w };
+            if label_end > label_start {
+                let max_cells = ((label_end - label_start) / cell_w).floor() as usize;
+                for (cell, ch) in title.chars().take(max_cells).enumerate() {
+                    let glyph = self.atlas.glyph(&self.fonts, ch, 0);
+                    if glyph.w == 0 {
+                        continue;
+                    }
+                    let gx = label_start + cell as f32 * cell_w + glyph.xmin as f32;
+                    let gy = self.fonts.ascent - (glyph.ymin as f32 + glyph.h as f32);
+                    // Skip overhanging glyphs instead of letting them paint
+                    // into a neighboring tab.
+                    if gx < label_start || gx + glyph.w as f32 > label_end {
+                        continue;
+                    }
+                    let (u0, v0, u1, v1) = self.atlas.uv(glyph);
+                    push_glyph(
+                        verts,
+                        width,
+                        height,
+                        gx,
+                        gy,
+                        glyph.w as f32,
+                        glyph.h as f32,
+                        u0,
+                        v0,
+                        u1,
+                        v1,
+                        palette.foreground,
+                    );
+                }
+            }
+
+            if has_close {
+                let cx = x + tab_w - cell_w * 1.5;
+                self.push_header_char(verts, 'x', cx, width, height, palette.foreground);
+            }
+        }
+        if new_w > 0.0 {
+            push_solid(
+                verts,
+                width,
+                height,
+                new_x,
+                0.0,
+                new_w,
+                cell_h,
+                palette.background,
+            );
+            if new_w >= cell_w {
+                let cx = new_x + ((new_w - cell_w) * 0.5);
+                self.push_header_char(verts, '+', cx, width, height, palette.foreground);
+            }
+        }
+    }
+
+    fn push_header_char(
+        &mut self,
+        verts: &mut Vec<Vertex>,
+        ch: char,
+        x: f32,
+        width: f32,
+        height: f32,
+        color: Rgb,
+    ) {
+        let glyph = self.atlas.glyph(&self.fonts, ch, 0);
+        if glyph.w == 0 {
+            return;
+        }
+        let gx = x + (self.fonts.cell_width - glyph.w as f32) * 0.5 + glyph.xmin as f32;
+        if gx < x || gx + glyph.w as f32 > x + self.fonts.cell_width {
+            return;
+        }
+        let gy = self.fonts.ascent - (glyph.ymin as f32 + glyph.h as f32);
+        let (u0, v0, u1, v1) = self.atlas.uv(glyph);
+        push_glyph(
+            verts,
+            width,
+            height,
+            gx,
+            gy,
+            glyph.w as f32,
+            glyph.h as f32,
+            u0,
+            v0,
+            u1,
+            v1,
+            color,
+        );
     }
 
     fn sync_atlas(&mut self) {

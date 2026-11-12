@@ -1,8 +1,8 @@
 # aiterm
 
-A cross-platform GPU terminal. Milestone 1 is one window, one shell, usable for ordinary work: colors, full-screen programs, scrollback, and copy/paste.
+A cross-platform GPU terminal with a clickable tab bar. Each tab has its own terminal, PTY, title, and scrollback; background tabs keep running and producing output. Closing a tab kills its shell, and a shell that exits closes only its own tab. Closing the last tab closes the window.
 
-Later milestones (not in this tree) are aimed at a lightweight, customizable, agent-ready terminal: tabs with live agent status, an agent sidebar, headless sessions, and global search, on Windows, macOS, and Linux.
+New tabs use the configured shell and the process launch working directory. The renderer shares one device and glyph atlas across tabs. The project is aimed at Windows, macOS, and Linux.
 
 ## Build and run
 
@@ -56,10 +56,10 @@ One binary, `aiterm`. The modules are the seams later milestones hang off; they 
 
 | Module | Role |
 | --- | --- |
-| `app` | winit window loop. Tabs, splits, and an agent sidebar belong here. |
-| `terminal` | One VT grid. A future pane is another instance. |
+| `app` | winit window loop and tab bar. |
+| `terminal` | One VT grid per tab. |
 | `pty` | Child process and PTY. A headless session can own this without a window. |
-| `renderer` | Glyph atlas and wgpu frame. Tabs would share the device and the atlas. |
+| `renderer` | Glyph atlas and wgpu frame, shared across tabs. |
 | `input` | xterm key and mouse sequences. |
 | `config`, `color`, `font` | TOML, palette, monospace face lookup. |
 
@@ -67,7 +67,7 @@ One binary, `aiterm`. The modules are the seams later milestones hang off; they 
 
 **PTY.** [portable-pty](https://github.com/wezterm/wezterm) opens a POSIX pty on Unix and ConPTY on Windows behind one API. With no `shell` key, Unix launches the login shell (`$SHELL`, then passwd) and Windows launches `%COMSPEC%` (usually `cmd.exe`). Set `shell = "powershell.exe"` for PowerShell. `TERM` is `xterm-256color` and `COLORTERM` is `truecolor`.
 
-**Rendering.** Alacritty's own renderer is OpenGL and is tied to its window. aiterm keeps the grid and draws it with wgpu: fontdue rasterizes one codepoint into an R8 atlas, and the frame is solid cells plus glyph quads. That leaves room for a sidebar and tab strip in the same pass later, and it uses Vulkan, Metal, or D3D12 on a real GPU.
+**Rendering.** Alacritty's own renderer is OpenGL and is tied to its window. aiterm keeps the grid and draws it with wgpu: fontdue rasterizes one codepoint into an R8 atlas, and the frame is solid cells plus glyph quads. Tabs share the renderer's device and atlas. It uses Vulkan, Metal, or D3D12 on a real GPU.
 
 ## Config
 
@@ -108,11 +108,11 @@ Ctrl combinations, arrows (including application cursor mode), Home/End, Page Up
 
 The mouse wheel scrolls the scrollback (three lines per notch). Shift+Page Up / Shift+Page Down do the same. Drag with the left button to select; releasing copies to the clipboard. Paste is Ctrl+Shift+V, copy is Ctrl+Shift+C. On macOS those are Command+C and Command+V. Shift+Insert also pastes. On Linux the selection is also written to the primary clipboard. The clipboard handle stays open for the life of the window so the selection remains available on X11 without a clipboard manager.
 
-Ctrl+Tab is swallowed so a later tab switcher can have it.
+Click a tab to select it. Click **+** or press Ctrl+Shift+T to open a tab; press Ctrl+Shift+W to close the active tab. On macOS, Cmd+T and Cmd+W open and close tabs. Ctrl+Tab and Ctrl+Shift+Tab cycle through tabs.
 
 ## Known limitations
 
-- One window, one shell. No tabs, splits, profiles, search, hyperlinks, or bell.
+- No splits, profiles, search, hyperlinks, or bell.
 - The config is read once at startup. There is no hot reload.
 - Glyphs are one codepoint per cell. No ligatures and no text shaping. Combining marks are not drawn on top of the base character. Wide characters use the core's wide-cell flags.
 - Bold and italic are used when a distinct font file exists. Otherwise bold is a one-pixel overstrike and italic is the regular face.
@@ -123,11 +123,6 @@ Ctrl+Tab is swallowed so a later tab switcher can have it.
 - `shell` is a program path. It is not parsed as a command line.
 - Windows build, tests, and Clippy have a native CI workflow, but its results must be checked on the submitted revision. Interactive Windows behavior still needs the desktop smoke check above. macOS has not been built or run. Linux validation used lavapipe, a software Vulkan adapter, so it does not prove hardware GPU operation.
 
-## Milestone 2
+## Next steps
 
-Suggested next steps, in an order that keeps the current modules:
-
-1. **Tabs.** A tab owns a `Terminal` plus a `PtySession`. `app` draws a tab strip and routes input to the active pair. The renderer keeps one device and one atlas.
-2. **Splits.** Same pair, with a layout tree instead of a single grid origin.
-3. **Profiles.** Named config blocks (`shell`, font, palette, cwd) that a new tab can pick up.
-4. **Hot reload.** Watch the TOML file and rebuild the palette and, when the font changes, the atlas, without restarting the shell.
+Splits, profiles, hot reload, search, and agent features are future work.
