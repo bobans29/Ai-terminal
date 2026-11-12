@@ -3,7 +3,7 @@
 //! This is a thin owner of `alacritty_terminal`: parser, scrollback, selection,
 //! and the modes programs like vim use (alternate screen, bracketed paste,
 //! application cursor keys). Bytes from the PTY go in; a grid the renderer can
-//! walk comes out. One [`Terminal`] is one pane. Tabs would hold several.
+//! walk comes out. One [`Terminal`] is one pane. Each tab owns one.
 
 use std::cell::RefCell;
 use std::rc::Rc;
