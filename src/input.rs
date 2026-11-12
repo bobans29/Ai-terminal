@@ -16,12 +16,20 @@ pub enum KeyAction {
     CloseTab,
     NextTab,
     PreviousTab,
+    SplitVertical,
+    SplitHorizontal,
+    NextPane,
+    PreviousPane,
+    ClosePane,
     Copy,
     Paste,
     None,
 }
 
 pub fn encode_key(key: &Key, mods: ModifiersState, mode: TermMode) -> KeyAction {
+    if let Some(action) = pane_action(key, mods) {
+        return action;
+    }
     if let Some(action) = tab_action(key, mods) {
         return action;
     }
@@ -53,6 +61,31 @@ pub fn encode_key(key: &Key, mods: ModifiersState, mode: TermMode) -> KeyAction 
         return character_bytes(text, mods);
     }
     KeyAction::None
+}
+
+fn pane_action(key: &Key, mods: ModifiersState) -> Option<KeyAction> {
+    let exact_ctrl_shift =
+        mods.control_key() && mods.shift_key() && !mods.alt_key() && !mods.super_key();
+    if let Key::Character(text) = key {
+        if exact_ctrl_shift {
+            return match text.to_ascii_lowercase().as_str() {
+                "d" => Some(KeyAction::SplitVertical),
+                "e" => Some(KeyAction::SplitHorizontal),
+                "x" => Some(KeyAction::ClosePane),
+                _ => None,
+            };
+        }
+    }
+    if mods.alt_key() && !mods.control_key() && !mods.shift_key() && !mods.super_key() {
+        if let Key::Named(named) = key {
+            return match named {
+                NamedKey::ArrowRight => Some(KeyAction::NextPane),
+                NamedKey::ArrowLeft => Some(KeyAction::PreviousPane),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 fn tab_action(key: &Key, mods: ModifiersState) -> Option<KeyAction> {
@@ -448,6 +481,76 @@ mod tests {
                 TermMode::empty()
             ),
             vec![0x17]
+        );
+    }
+
+    #[test]
+    fn pane_shortcuts_use_exact_modifiers_and_preserve_shell_keys() {
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        for (letter, expected) in [
+            ("d", KeyAction::SplitVertical),
+            ("E", KeyAction::SplitHorizontal),
+            ("x", KeyAction::ClosePane),
+        ] {
+            let actual = encode_key(
+                &Key::Character(letter.into()),
+                ctrl_shift,
+                TermMode::empty(),
+            );
+            assert!(std::mem::discriminant(&actual) == std::mem::discriminant(&expected));
+        }
+        assert!(matches!(
+            encode_key(
+                &Key::Named(NamedKey::ArrowRight),
+                ModifiersState::ALT,
+                TermMode::empty()
+            ),
+            KeyAction::NextPane
+        ));
+        assert!(matches!(
+            encode_key(
+                &Key::Named(NamedKey::ArrowLeft),
+                ModifiersState::ALT,
+                TermMode::empty()
+            ),
+            KeyAction::PreviousPane
+        ));
+
+        // Extra modifiers keep these keys available to the terminal.
+        for mods in [
+            ctrl_shift | ModifiersState::ALT,
+            ctrl_shift | ModifiersState::SUPER,
+        ] {
+            assert!(matches!(
+                encode_key(&Key::Character("d".into()), mods, TermMode::empty()),
+                KeyAction::Bytes(_)
+            ));
+        }
+        assert!(matches!(
+            encode_key(
+                &Key::Named(NamedKey::ArrowRight),
+                ModifiersState::ALT | ModifiersState::SHIFT,
+                TermMode::empty()
+            ),
+            KeyAction::Bytes(_)
+        ));
+        for (letter, code) in [("d", 0x04), ("e", 0x05), ("x", 0x18)] {
+            assert_eq!(
+                bytes(
+                    Key::Character(letter.into()),
+                    ModifiersState::CONTROL,
+                    TermMode::empty()
+                ),
+                vec![code]
+            );
+        }
+        assert_eq!(
+            bytes(
+                Key::Named(NamedKey::ArrowRight),
+                ModifiersState::empty(),
+                TermMode::empty()
+            ),
+            b"\x1b[C"
         );
     }
 

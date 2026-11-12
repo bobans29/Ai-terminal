@@ -1,8 +1,8 @@
 # aiterm
 
-A cross-platform GPU terminal with a clickable tab bar. Each tab has its own terminal, PTY, title, and scrollback; background tabs keep running and producing output. Closing a tab kills its shell, and a shell that exits closes only its own tab. Closing the last tab closes the window.
+A cross-platform GPU terminal with tabs and split panes. Each tab contains a horizontal or vertical pane layout; every pane has its own terminal grid, shell, and scrollback. Tabs and panes share one window, renderer device, and glyph atlas. Background sessions keep running and producing output. Closing a pane kills its shell and collapses the layout; when its shell exits, only that pane closes. The last pane closes its tab, and the last tab closes the window. The tab label and window title follow the focused pane.
 
-New tabs use the configured shell and the process launch working directory. The renderer shares one device and glyph atlas across tabs. The project is aimed at Windows, macOS, and Linux.
+New tabs and panes use the configured shell and the application process launch working directory. The project is aimed at Windows, macOS, and Linux.
 
 ## Build and run
 
@@ -56,8 +56,8 @@ One binary, `aiterm`. The modules are the seams later milestones hang off; they 
 
 | Module | Role |
 | --- | --- |
-| `app` | winit window loop and tab bar. |
-| `terminal` | One VT grid per tab. |
+| `app` | winit window loop, tab bar, pane layouts, and input. |
+| `terminal` | One VT grid per pane. |
 | `pty` | Child process and PTY. A headless session can own this without a window. |
 | `renderer` | Glyph atlas and wgpu frame, shared across tabs. |
 | `input` | xterm key and mouse sequences. |
@@ -110,9 +110,11 @@ The mouse wheel scrolls the scrollback (three lines per notch). Shift+Page Up / 
 
 Click a tab to select it. Click **+** or press Ctrl+Shift+T to open a tab; press Ctrl+Shift+W to close the active tab. On macOS, Cmd+T and Cmd+W open and close tabs. Ctrl+Tab and Ctrl+Shift+Tab cycle through tabs.
 
+Within a tab, press Ctrl+Shift+D to split side by side or Ctrl+Shift+E to split into stacked panes. A new pane starts the configured shell in the application launch working directory. Click a pane to focus it; Alt+Right and Alt+Left cycle focus. Drag a divider to resize panes. Ctrl+Shift+X closes the focused pane; Ctrl+Shift+W still closes the whole tab. Layouts that would make panes too small are rejected.
+
 ## Known limitations
 
-- No splits, profiles, search, hyperlinks, or bell.
+- Profiles, search, hyperlinks, and bell are not implemented.
 - The config is read once at startup. There is no hot reload.
 - Glyphs are one codepoint per cell. No ligatures and no text shaping. Combining marks are not drawn on top of the base character. Wide characters use the core's wide-cell flags.
 - Bold and italic are used when a distinct font file exists. Otherwise bold is a one-pixel overstrike and italic is the regular face.
@@ -125,4 +127,4 @@ Click a tab to select it. Click **+** or press Ctrl+Shift+T to open a tab; press
 
 ## Next steps
 
-Splits, profiles, hot reload, search, and agent features are future work.
+Profiles, hot reload, search, and agent features are future work.

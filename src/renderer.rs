@@ -6,6 +6,7 @@
 //! sampled on the GPU. Tabs share the device and the atlas.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use alacritty_terminal::term::cell::Flags;
@@ -16,6 +17,7 @@ use winit::window::Window;
 
 use crate::color::{self, Palette, Rgb};
 use crate::font::FontSet;
+use crate::layout::Rect;
 use crate::tab_bar;
 use crate::terminal::Terminal;
 
@@ -27,6 +29,13 @@ pub enum CursorPaint {
     Off,
     Active,
     Hollow,
+}
+
+pub struct PanePaint<'a> {
+    pub terminal: &'a Terminal,
+    pub rect: Rect,
+    pub cursor: CursorPaint,
+    pub focused: bool,
 }
 
 pub enum DrawResult {
@@ -42,6 +51,16 @@ struct Vertex {
     uv: [f32; 2],
     color: [f32; 4],
     mode: u32,
+}
+
+struct DrawBatch {
+    clip: Rect,
+    vertices: Range<u32>,
+}
+
+struct FrameVertices {
+    vertices: Vec<Vertex>,
+    batches: Vec<DrawBatch>,
 }
 
 pub struct Renderer {
@@ -161,28 +180,28 @@ impl Renderer {
 
     pub fn draw(
         &mut self,
-        terminal: &Terminal,
+        panes: &[PanePaint<'_>],
         palette: &Palette,
-        cursor: CursorPaint,
         titles: &[String],
         active: usize,
     ) -> DrawResult {
         if self.config.width == 0 || self.config.height == 0 {
             return DrawResult::Ok;
         }
-        let mut verts = self.build_vertices(terminal, palette, cursor, titles, active);
+        let mut frame_verts = self.build_frame(panes, palette, titles, active);
         // Rasterizing a new glyph can grow the atlas. UVs baked above would
         // then be wrong, so build the frame once more against the final atlas.
         if self.atlas.grew {
             self.atlas.grew = false;
-            verts = self.build_vertices(terminal, palette, cursor, titles, active);
+            frame_verts = self.build_frame(panes, palette, titles, active);
             self.atlas.grew = false;
         }
         self.sync_atlas();
+        let verts = &frame_verts.vertices;
         self.ensure_vertex_buffer(verts.len());
         if !verts.is_empty() {
             self.queue
-                .write_buffer(&self.vertex_buf, 0, bytemuck::cast_slice(&verts));
+                .write_buffer(&self.vertex_buf, 0, bytemuck::cast_slice(verts));
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -224,7 +243,15 @@ impl Renderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-                pass.draw(0..verts.len() as u32, 0..1);
+                for batch in &frame_verts.batches {
+                    pass.set_scissor_rect(
+                        batch.clip.x,
+                        batch.clip.y,
+                        batch.clip.width,
+                        batch.clip.height,
+                    );
+                    pass.draw(batch.vertices.clone(), 0..1);
+                }
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -232,14 +259,76 @@ impl Renderer {
         DrawResult::Ok
     }
 
-    fn build_vertices(
+    fn build_frame(
         &mut self,
-        terminal: &Terminal,
+        panes: &[PanePaint<'_>],
         palette: &Palette,
-        cursor: CursorPaint,
         titles: &[String],
         active: usize,
-    ) -> Vec<Vertex> {
+    ) -> FrameVertices {
+        let mut frame = FrameVertices {
+            vertices: Vec::new(),
+            batches: Vec::new(),
+        };
+        let width = self.config.width;
+        let height = self.config.height;
+        for pane in panes {
+            let Some(clip) = clip_rect(pane.rect, width, height) else {
+                continue;
+            };
+            let start = frame.vertices.len() as u32;
+            frame
+                .vertices
+                .extend(self.build_pane_vertices(pane, palette));
+            if panes.len() > 1 {
+                stroke_rect(
+                    &mut frame.vertices,
+                    width as f32,
+                    height as f32,
+                    pane.rect.x as f32,
+                    pane.rect.y as f32,
+                    pane.rect.width as f32,
+                    pane.rect.height as f32,
+                    if pane.focused {
+                        palette.cursor
+                    } else {
+                        palette.selection
+                    },
+                );
+            }
+            frame.batches.push(DrawBatch {
+                clip,
+                vertices: start..frame.vertices.len() as u32,
+            });
+        }
+        // The tab bar is a separate clipped batch, painted exactly once.
+        let header = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: (self.fonts.cell_height.ceil() as u32).min(height),
+        };
+        if let Some(clip) = clip_rect(header, width, height) {
+            let start = frame.vertices.len() as u32;
+            self.build_tab_bar(
+                &mut frame.vertices,
+                palette,
+                titles,
+                active,
+                width as f32,
+                height as f32,
+            );
+            frame.batches.push(DrawBatch {
+                clip,
+                vertices: start..frame.vertices.len() as u32,
+            });
+        }
+        frame
+    }
+
+    fn build_pane_vertices(&mut self, pane: &PanePaint<'_>, palette: &Palette) -> Vec<Vertex> {
+        let terminal = pane.terminal;
+        let cursor = pane.cursor;
         let mut verts = Vec::new();
         let width = self.config.width as f32;
         let height = self.config.height as f32;
@@ -262,8 +351,8 @@ impl Renderer {
             let Some(vp) = point_to_viewport(display_offset, indexed.point) else {
                 continue;
             };
-            let x = vp.column.0 as f32 * cell_w;
-            let y = cell_h + vp.line as f32 * cell_h;
+            let x = pane.rect.x as f32 + vp.column.0 as f32 * cell_w;
+            let y = pane.rect.y as f32 + vp.line as f32 * cell_h;
             let flags = indexed.cell.flags;
             let mut fg = color::resolve(palette, colors, indexed.cell.fg);
             let mut bg = color::resolve(palette, colors, indexed.cell.bg);
@@ -419,7 +508,6 @@ impl Renderer {
         }
         verts.extend(backs);
         verts.extend(front);
-        self.build_tab_bar(&mut verts, palette, titles, active, width, height);
         verts
     }
 
@@ -604,6 +692,21 @@ impl Renderer {
         self.vertex_capacity = len.next_power_of_two().max(4096);
         self.vertex_buf = vertex_buffer(&self.device, self.vertex_capacity);
     }
+}
+
+/// Clamp every GPU scissor to the surface, including during very small resizes.
+/// Empty rectangles are skipped because wgpu rejects zero-size scissors.
+fn clip_rect(rect: Rect, width: u32, height: u32) -> Option<Rect> {
+    let right = rect.x.saturating_add(rect.width).min(width);
+    let bottom = rect.y.saturating_add(rect.height).min(height);
+    let x = rect.x.min(width);
+    let y = rect.y.min(height);
+    (right > x && bottom > y).then_some(Rect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    })
 }
 
 fn style_index(flags: Flags) -> u8 {
@@ -1182,3 +1285,75 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(in.color.rgb, in.color.a * alpha);
 }
 "#;
+
+#[cfg(test)]
+mod pane_tests {
+    use super::clip_rect;
+    use crate::layout::Rect;
+
+    #[test]
+    fn scissors_are_clamped_and_empty_panes_are_skipped() {
+        assert_eq!(
+            clip_rect(
+                Rect {
+                    x: 80,
+                    y: 20,
+                    width: 50,
+                    height: 60
+                },
+                100,
+                50
+            ),
+            Some(Rect {
+                x: 80,
+                y: 20,
+                width: 20,
+                height: 30
+            })
+        );
+        assert_eq!(
+            clip_rect(
+                Rect {
+                    x: 100,
+                    y: 0,
+                    width: 10,
+                    height: 20
+                },
+                100,
+                50
+            ),
+            None
+        );
+        assert_eq!(
+            clip_rect(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 20
+                },
+                100,
+                50
+            ),
+            None
+        );
+        assert_eq!(
+            clip_rect(
+                Rect {
+                    x: 1,
+                    y: 1,
+                    width: u32::MAX,
+                    height: u32::MAX
+                },
+                100,
+                50
+            ),
+            Some(Rect {
+                x: 1,
+                y: 1,
+                width: 99,
+                height: 49
+            })
+        );
+    }
+}
