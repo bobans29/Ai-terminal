@@ -41,6 +41,9 @@ jobs:
           $peOffset = [BitConverter]::ToInt32($image, 0x3c)
           $subsystem = [BitConverter]::ToUInt16($image, $peOffset + 24 + 68)
           if ($subsystem -ne 2) { throw 'Release must use the Windows GUI subsystem (2).' }
+      - name: Verify release CLI output in a parent console
+        if: runner.os == 'Windows'
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-console-output.ps1
       - name: Test release source selection
         if: runner.os == 'Windows'
         run: pwsh -NoProfile -File scripts/windows/test-release-source.ps1

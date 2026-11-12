@@ -1,16 +1,22 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(windows)]
+#[path = "platform/windows.rs"]
+mod platform;
+#[cfg(not(windows))]
+#[path = "platform/other.rs"]
+mod platform;
+
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    platform::initialize();
     let args = match parse_args_from(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(err) => {
-            eprintln!("aiterm: {err}");
-            eprintln!("try `aiterm --help`");
-            return ExitCode::from(2);
+            return fail(&format!("{err}\ntry `aiterm --help`"), 2);
         }
     };
 
@@ -20,10 +26,15 @@ fn main() -> ExitCode {
     }
 
     if let Err(err) = aiterm::run_with_profile(args.config, args.profile) {
-        eprintln!("aiterm: {err}");
-        return ExitCode::from(1);
+        return fail(&err, 1);
     }
     ExitCode::SUCCESS
+}
+
+fn fail(message: &str, code: u8) -> ExitCode {
+    eprintln!("aiterm: {message}");
+    platform::report_error(message);
+    ExitCode::from(code)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
