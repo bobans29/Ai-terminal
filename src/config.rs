@@ -70,12 +70,12 @@ fn config_dir() -> PathBuf {
     #[cfg(windows)]
     {
         let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-        return PathBuf::from(base).join("aiterm");
+        PathBuf::from(base).join("aiterm")
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        return PathBuf::from(home).join("Library/Application Support/aiterm");
+        PathBuf::from(home).join("Library/Application Support/aiterm")
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

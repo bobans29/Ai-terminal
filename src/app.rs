@@ -649,6 +649,7 @@ impl App {
         };
         if let Err(err) = clipboard.set_text(text) {
             eprintln!("aiterm: copy failed: {err}");
+            #[cfg(target_os = "linux")]
             return;
         }
         #[cfg(target_os = "linux")]

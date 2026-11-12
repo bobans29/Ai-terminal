@@ -162,3 +162,52 @@ fn read_loop(mut reader: Box<dyn Read + Send>, on_output: impl Fn(PtyMsg)) {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::{PtyMsg, PtySession};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    // Exercises ConPTY directly, without requiring a window or GPU on the CI runner.
+    #[test]
+    fn default_shell_accepts_input_resizes_and_exits() {
+        let (tx, rx) = mpsc::channel();
+        let mut session = PtySession::spawn(None, 80, 24, 0, 0, move |message| {
+            let _ = tx.send(message);
+        })
+        .expect("start the default Windows shell through ConPTY");
+        session.resize(100, 30, 0, 0).expect("resize ConPTY");
+        let size = session.master.get_size().expect("read ConPTY size");
+        assert_eq!((size.cols, size.rows), (100, 30));
+
+        // The expected marker does not occur in the input: cmd must expand the
+        // environment variable, so echoed keystrokes cannot make this pass.
+        session
+            .write(b"echo AITERM_%TERM_PROGRAM%_READY\r")
+            .expect("queue command input");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut output = Vec::new();
+        while !String::from_utf8_lossy(&output).contains("AITERM_aiterm_READY") {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx
+                .recv_timeout(remaining)
+                .expect("receive shell output before timeout")
+            {
+                PtyMsg::Data(bytes) => output.extend(bytes),
+                PtyMsg::Closed => panic!("ConPTY closed before the shell executed the command"),
+            }
+        }
+
+        session.write(b"exit /b 0\r").expect("queue shell exit");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = session.child.try_wait().expect("query shell status") {
+                assert!(status.success(), "shell exit status: {status:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "shell did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
