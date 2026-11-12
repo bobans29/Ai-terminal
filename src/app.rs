@@ -251,8 +251,13 @@ impl App {
         self.active = self.active.min(self.tabs.len() - 1);
         if was_active {
             self.report_focus(self.focused);
+            self.switch_tab(self.active);
+        } else {
+            // Removing another tab may shift the active index, but it does
+            // not change the session or interrupt its selection/mouse drag.
+            self.update_title();
+            self.request_redraw();
         }
-        self.switch_tab(self.active);
     }
 
     fn request_redraw(&self) {
