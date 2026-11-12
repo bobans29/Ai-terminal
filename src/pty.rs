@@ -7,6 +7,7 @@
 //! can own a [`PtySession`] without a window.
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
@@ -30,14 +31,26 @@ pub struct PtySession {
 }
 
 impl PtySession {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         shell: Option<&str>,
+        cwd: Option<&Path>,
         cols: u16,
         rows: u16,
         pixel_width: u16,
         pixel_height: u16,
         on_output: impl Fn(PtyMsg) + Send + 'static,
     ) -> Result<Self, String> {
+        if let Some(cwd) = cwd {
+            let metadata = std::fs::metadata(cwd)
+                .map_err(|err| format!("invalid working directory '{}': {err}", cwd.display()))?;
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "working directory '{}' is not a directory",
+                    cwd.display()
+                ));
+            }
+        }
         let size = PtySize {
             rows,
             cols,
@@ -56,7 +69,9 @@ impl PtySession {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "aiterm");
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = cwd {
+            cmd.cwd(cwd);
+        } else if let Ok(cwd) = std::env::current_dir() {
             cmd.cwd(cwd);
         }
 
@@ -173,7 +188,7 @@ mod windows_tests {
     #[test]
     fn default_shell_accepts_input_resizes_and_exits() {
         let (tx, rx) = mpsc::channel();
-        let mut session = PtySession::spawn(None, 80, 24, 0, 0, move |message| {
+        let mut session = PtySession::spawn(None, None, 80, 24, 0, 0, move |message| {
             let _ = tx.send(message);
         })
         .expect("start the default Windows shell through ConPTY");
@@ -209,5 +224,105 @@ mod windows_tests {
             assert!(Instant::now() < deadline, "shell did not exit");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::{PtyMsg, PtySession};
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("aiterm pty-日本-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&path).expect("create temporary working directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn shell_starts_in_explicit_unicode_working_directory() {
+        let temp = TempDir::new();
+        let expected = temp.0.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::channel();
+        let mut session = PtySession::spawn(
+            Some("/bin/sh"),
+            Some(&temp.0),
+            80,
+            24,
+            0,
+            0,
+            move |message| {
+                let _ = tx.send(message);
+            },
+        )
+        .expect("start shell in explicit working directory");
+        session
+            .write(b"printf '\\nAITERM_CWD_%s_END\\n' \"$(pwd)\"\r")
+            .expect("queue pwd");
+        let marker = format!("AITERM_CWD_{expected}_END");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining).unwrap_or_else(|err| {
+                panic!(
+                    "receive pwd output before timeout: {err}; output: {:?}",
+                    String::from_utf8_lossy(&output)
+                )
+            }) {
+                PtyMsg::Data(bytes) => {
+                    output.extend(bytes);
+                    if String::from_utf8_lossy(&output).contains(&marker) {
+                        break;
+                    }
+                }
+                PtyMsg::Closed => panic!("pty closed before pwd output"),
+            }
+        }
+        assert!(String::from_utf8_lossy(&output).contains(&marker));
+
+        session.write(b"exit 0\n").expect("queue shell exit");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = session.child.try_wait().expect("query shell status") {
+                assert!(status.success(), "shell exit status: {status:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "shell did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(session);
+        drop(temp);
+        assert!(
+            !std::path::Path::new(&expected).exists(),
+            "temporary directory leaked"
+        );
+    }
+
+    #[test]
+    fn nonexistent_working_directory_returns_path_error() {
+        let path = std::env::temp_dir().join(format!("aiterm missing-日本-{}", std::process::id()));
+        let error = match PtySession::spawn(Some("/bin/sh"), Some(&path), 80, 24, 0, 0, |_| {}) {
+            Ok(_) => panic!("nonexistent cwd must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains(&path.display().to_string()), "{error}");
     }
 }

@@ -1,8 +1,8 @@
 # aiterm
 
-A cross-platform GPU terminal with a clickable tab bar. Each tab has its own terminal, PTY, title, and scrollback; background tabs keep running and producing output. Closing a tab kills its shell, and a shell that exits closes only its own tab. Closing the last tab closes the window.
+A cross-platform GPU terminal with tabs and split panes. Each tab contains a horizontal or vertical pane layout; every pane has its own terminal grid, shell, and scrollback. Tabs and panes share one window, renderer device, and glyph atlas. Background sessions keep running and producing output. Closing a pane kills its shell and collapses the layout; when its shell exits, only that pane closes. The last pane closes its tab, and the last tab closes the window. The tab label and window title follow the focused pane.
 
-New tabs use the configured shell and the process launch working directory. The renderer shares one device and glyph atlas across tabs. The project is aimed at Windows, macOS, and Linux.
+New tabs and panes use the selected profile's settings, falling back to the global settings. The project is aimed at Windows, macOS, and Linux.
 
 ## Build and run
 
@@ -56,8 +56,8 @@ One binary, `aiterm`. The modules are the seams later milestones hang off; they 
 
 | Module | Role |
 | --- | --- |
-| `app` | winit window loop and tab bar. |
-| `terminal` | One VT grid per tab. |
+| `app` | winit window loop, tab bar, pane layouts, and input. |
+| `terminal` | One VT grid per pane. |
 | `pty` | Child process and PTY. A headless session can own this without a window. |
 | `renderer` | Glyph atlas and wgpu frame, shared across tabs. |
 | `input` | xterm key and mouse sequences. |
@@ -90,6 +90,10 @@ font_size = 15.0
 scrollback = 10000
 # Program path, not a shell command line. Unset = login shell / %COMSPEC%.
 # shell = "powershell.exe"
+# Optional literal directory. Relative paths use the application launch directory.
+# cwd = 'C:\Users\me\work'
+# Optional profile name, overridden by --profile NAME.
+# default_profile = "large"
 
 [colors]
 background = "#1e1e2e"
@@ -99,6 +103,21 @@ selection = "#45475a"
 # black, red, green, yellow, blue, magenta, cyan, white
 # bright_black … bright_white
 ```
+
+Root settings (`shell`, `cwd`, `font_family`, `font_size`, and `scrollback`) are global defaults. `cwd` is a directory path given as a TOML string; relative paths are resolved against the application launch directory. Tilde and environment variable expansion are not performed. If `cwd` is omitted, the application launch directory is used.
+
+Named profiles can override any of those settings and any subset of the palette. A profile inherits missing values from the global settings, never from another profile. `--profile NAME` selects a profile at launch and overrides `default_profile`; without either choice, global settings are used. For example:
+
+```toml
+[profiles.large]
+font_size = 18.0
+# cwd = 'C:\Users\me\work'
+
+[profiles.large.colors]
+background = "#11111b"
+```
+
+Profile names are case-sensitive. The runtime rejects invalid profile values and a `default_profile` that does not name a configured profile. If starting a selected profile's shell fails, the error is reported on stderr and existing panes stay open. Each pane keeps its own profile's font and palette while sharing the renderer and glyph atlas.
 
 `font_size` is pixels at scale 1 and follows the window scale factor. It is clamped to 6–72. Scrollback is capped at 200,000 lines. 256-color and truecolor values are computed, not configured. Unknown keys are rejected.
 
@@ -110,10 +129,12 @@ The mouse wheel scrolls the scrollback (three lines per notch). Shift+Page Up / 
 
 Click a tab to select it. Click **+** or press Ctrl+Shift+T to open a tab; press Ctrl+Shift+W to close the active tab. On macOS, Cmd+T and Cmd+W open and close tabs. Ctrl+Tab and Ctrl+Shift+Tab cycle through tabs.
 
+Within a tab, press Ctrl+Shift+D to split side by side or Ctrl+Shift+E to split into stacked panes. A new pane starts with the currently selected profile. Press Ctrl+Shift+P to cycle through global settings and then profiles in sorted name order. The header's **New: NAME** badge also cycles the selection. The selection affects only new tabs and panes; existing panes keep their shell, working directory, scrollback, font, and palette. Click a pane to focus it; Alt+Right and Alt+Left cycle focus. Drag a divider to resize panes. Ctrl+Shift+X closes the focused pane; Ctrl+Shift+W still closes the whole tab. Layouts that would make panes too small are rejected.
+
 ## Known limitations
 
-- No splits, profiles, search, hyperlinks, or bell.
-- The config is read once at startup. There is no hot reload.
+- Search, hyperlinks, and bell are not implemented.
+- The config is read once at startup. Live reload and a profile GUI editor are future work.
 - Glyphs are one codepoint per cell. No ligatures and no text shaping. Combining marks are not drawn on top of the base character. Wide characters use the core's wide-cell flags.
 - Bold and italic are used when a distinct font file exists. Otherwise bold is a one-pixel overstrike and italic is the regular face.
 - IME commit strings are written to the shell. The preedit popup is not drawn. This path has not been tried on Windows.
@@ -125,4 +146,4 @@ Click a tab to select it. Click **+** or press Ctrl+Shift+T to open a tab; press
 
 ## Next steps
 
-Splits, profiles, hot reload, search, and agent features are future work.
+Hot reload, a profile GUI editor, search, and agent features are future work.

@@ -1,8 +1,7 @@
 //! Window loop.
 //!
 //! winit owns the frame. This module turns key and mouse events into PTY
-//! bytes and asks the renderer to paint the grid. Tabs, splits, and an agent
-//! sidebar live here; they should not leak into [`crate::terminal`] or
+//! bytes and asks the renderer to paint the panes. Tabs and splits live here; they should not leak into [`crate::terminal`] or
 //! [`crate::pty`].
 
 use std::sync::Arc;
@@ -19,12 +18,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Theme, Window, WindowId};
 
-use crate::config::Config;
+use crate::config::{Config, Profile};
 use crate::font::FontSet;
 use crate::input::{self, KeyAction};
+use crate::layout::{Axis, Layout, Rect};
 use crate::pty::{PtyMsg, PtySession};
-use crate::renderer::{CursorPaint, DrawResult, Renderer};
+use crate::renderer::{CursorPaint, DrawResult, PanePaint, Renderer};
 use crate::terminal::Terminal;
+
+const DIVIDER: u32 = 4;
 
 const BLINK: Duration = Duration::from_millis(530);
 
@@ -33,11 +35,26 @@ enum UserEvent {
     Closed(u64),
 }
 
-struct Tab {
+struct Pane {
     id: u64,
+    profile: Profile,
+    font: usize,
+    rect: Rect,
     terminal: Terminal,
     pty: PtySession,
     title: String,
+}
+
+struct Tab {
+    panes: Vec<Pane>,
+    active_pane: usize,
+    layout: Layout,
+}
+
+impl Tab {
+    fn title(&self) -> &str {
+        &self.panes[self.active_pane].title
+    }
 }
 
 #[derive(Default)]
@@ -65,15 +82,17 @@ impl Composition {
 
 struct App {
     config: Config,
+    selected_profile: Option<String>,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     tabs: Vec<Tab>,
     active: usize,
-    next_tab_id: u64,
+    next_pane_id: u64,
     modifiers: ModifiersState,
     pointer: PhysicalPosition<f64>,
     selecting: bool,
+    divider_drag: Option<Vec<bool>>,
     /// Bits 0..2 are left, middle, and right while held.
     mouse_buttons: u8,
     /// Unused pixel movement from touchpad scrolling.
@@ -107,17 +126,20 @@ pub fn run(config: Config) -> Result<(), String> {
 
 impl App {
     fn new(config: Config, proxy: EventLoopProxy<UserEvent>) -> Self {
+        let selected_profile = config.default_profile.clone();
         Self {
             config,
+            selected_profile,
             proxy,
             window: None,
             renderer: None,
             tabs: Vec::new(),
             active: 0,
-            next_tab_id: 0,
+            next_pane_id: 0,
             modifiers: ModifiersState::empty(),
             pointer: PhysicalPosition::new(0.0, 0.0),
             selecting: false,
+            divider_drag: None,
             mouse_buttons: 0,
             pixel_scroll: 0.0,
             composition: Composition::default(),
@@ -159,37 +181,116 @@ impl App {
         Ok(())
     }
 
+    fn pane(&self) -> Option<&Pane> {
+        let tab = self.tabs.get(self.active)?;
+        tab.panes.get(tab.active_pane)
+    }
+
+    fn pane_mut(&mut self) -> Option<&mut Pane> {
+        let tab = self.tabs.get_mut(self.active)?;
+        tab.panes.get_mut(tab.active_pane)
+    }
+
+    fn active_id(&self) -> Option<u64> {
+        self.pane().map(|pane| pane.id)
+    }
+
+    fn pane_location(&self, id: u64) -> Option<(usize, usize)> {
+        self.tabs.iter().enumerate().find_map(|(ti, tab)| {
+            tab.panes
+                .iter()
+                .position(|pane| pane.id == id)
+                .map(|pi| (ti, pi))
+        })
+    }
+
     fn terminal(&self) -> Option<&Terminal> {
-        self.tabs.get(self.active).map(|tab| &tab.terminal)
+        self.pane().map(|pane| &pane.terminal)
     }
 
     fn terminal_mut(&mut self) -> Option<&mut Terminal> {
-        self.tabs.get_mut(self.active).map(|tab| &mut tab.terminal)
+        self.pane_mut().map(|pane| &mut pane.terminal)
     }
 
-    fn new_tab(&mut self) -> Result<(), String> {
-        let size = self
-            .window
-            .as_ref()
-            .ok_or("window not initialized")?
-            .inner_size();
-        let (cell_w, cell_h) = self
+    fn content_bounds(&self) -> Option<Rect> {
+        let size = self.window.as_ref()?.inner_size();
+        let header = self.renderer.as_ref()?.cell_size().1 as u32;
+        Some(Rect {
+            x: 0,
+            y: header.min(size.height),
+            width: size.width,
+            height: size.height.saturating_sub(header),
+        })
+    }
+
+    fn leaf_minimum(&self) -> (u32, u32) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return (32, 32);
+        };
+        let mut size = (0.0f32, 0.0f32);
+        if let Some(tab) = self.tabs.get(self.active) {
+            for pane in &tab.panes {
+                let (cw, ch) = renderer.cell_size_for(pane.font);
+                size.0 = size.0.max(cw);
+                size.1 = size.1.max(ch);
+            }
+        }
+        ((size.0 * 4.0).ceil() as u32, (size.1 * 2.0).ceil() as u32)
+    }
+
+    fn selected_settings(&mut self) -> Result<(Profile, usize), String> {
+        let profile = self.config.profile(self.selected_profile.as_deref())?;
+        let font = self
+            .renderer
+            .as_mut()
+            .ok_or("renderer not initialized")?
+            .font_id(&profile.font_family, profile.font_size)?;
+        Ok((profile, font))
+    }
+
+    fn profile_label(&self) -> Option<String> {
+        if self.config.profiles.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "New: {}",
+            self.selected_profile.as_deref().unwrap_or("(global)")
+        ))
+    }
+
+    fn cycle_profile(&mut self) {
+        if self.config.profiles.is_empty() {
+            return;
+        }
+        let choices: Vec<Option<String>> = std::iter::once(None)
+            .chain(self.config.profiles.keys().cloned().map(Some))
+            .collect();
+        let current = choices
+            .iter()
+            .position(|name| name == &self.selected_profile)
+            .unwrap_or(0);
+        self.selected_profile = choices[(current + 1) % choices.len()].clone();
+        self.request_redraw();
+    }
+
+    fn spawn_pane(&mut self, rect: Rect, profile: Profile, font: usize) -> Result<Pane, String> {
+        let (cw, ch) = self
             .renderer
             .as_ref()
             .ok_or("renderer not initialized")?
-            .cell_size();
-        let height = size.height.saturating_sub(cell_h as u32);
-        let cols = grid_dim(size.width, cell_w, 2);
-        let rows = grid_dim(height, cell_h, 1);
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
+            .cell_size_for(font);
+        let cols = grid_dim(rect.width, cw, 2);
+        let rows = grid_dim(rect.height, ch, 1);
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
         let proxy = self.proxy.clone();
         let pty = PtySession::spawn(
-            self.config.shell.as_deref(),
+            profile.shell.as_deref(),
+            profile.cwd.as_deref(),
             cols as u16,
             rows as u16,
-            size.width.min(u16::MAX as u32) as u16,
-            height.min(u16::MAX as u32) as u16,
+            rect.width.min(u16::MAX as u32) as u16,
+            rect.height.min(u16::MAX as u32) as u16,
             move |msg| {
                 let event = match msg {
                     PtyMsg::Data(bytes) => UserEvent::Pty(id, bytes),
@@ -198,14 +299,134 @@ impl App {
                 let _ = proxy.send_event(event);
             },
         )?;
-        self.tabs.push(Tab {
+        Ok(Pane {
             id,
-            terminal: Terminal::new(cols, rows, self.config.scrollback),
+            rect,
+            terminal: Terminal::new(cols, rows, profile.scrollback),
+            profile,
+            font,
             pty,
             title: "aiterm".to_string(),
+        })
+    }
+
+    fn new_tab(&mut self) -> Result<(), String> {
+        let rect = self.content_bounds().ok_or("window not initialized")?;
+        let (profile, font) = self.selected_settings()?;
+        let pane = self.spawn_pane(rect, profile, font)?;
+        let id = pane.id;
+        self.tabs.push(Tab {
+            panes: vec![pane],
+            active_pane: 0,
+            layout: Layout::Leaf(id),
         });
         self.switch_tab(self.tabs.len() - 1);
         Ok(())
+    }
+
+    fn split_pane(&mut self, axis: Axis) -> Result<(), String> {
+        let (profile, font) = self.selected_settings()?;
+        let pane = self.pane().ok_or("no focused pane")?;
+        let rect = pane.rect;
+        let old_id = pane.id;
+        let (min_w, min_h) = self.leaf_minimum();
+        let (cw, ch) = self
+            .renderer
+            .as_ref()
+            .ok_or("renderer not initialized")?
+            .cell_size_for(font);
+        let min_w = min_w.max((cw * 4.0).ceil() as u32);
+        let min_h = min_h.max((ch * 2.0).ceil() as u32);
+        if rect.width < min_w || rect.height < min_h {
+            return Err("pane too small to split".into());
+        }
+        let mut new_rect = rect;
+        match axis {
+            Axis::Vertical => {
+                if rect.width < min_w * 2 + DIVIDER {
+                    return Err("pane too narrow to split".into());
+                }
+                let first = (rect.width - DIVIDER) / 2;
+                new_rect.x += first + DIVIDER;
+                new_rect.width = rect.width - first - DIVIDER;
+            }
+            Axis::Horizontal => {
+                if rect.height < min_h * 2 + DIVIDER {
+                    return Err("pane too short to split".into());
+                }
+                let first = (rect.height - DIVIDER) / 2;
+                new_rect.y += first + DIVIDER;
+                new_rect.height = rect.height - first - DIVIDER;
+            }
+        }
+        // Spawn before changing the tree so an invalid shell leaves the old
+        // layout and focused session intact.
+        let pane = self.spawn_pane(new_rect, profile, font)?;
+        let tab = &mut self.tabs[self.active];
+        if !tab.layout.split(old_id, pane.id, axis) {
+            return Err("focused pane missing from layout".into());
+        }
+        tab.panes.push(pane);
+        self.sync_grid();
+        self.focus_pane(self.tabs[self.active].panes.len() - 1);
+        Ok(())
+    }
+
+    fn focus_pane(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if index >= tab.panes.len() || index == tab.active_pane {
+            return;
+        }
+        self.release_mouse();
+        self.report_focus(false);
+        self.tabs[self.active].active_pane = index;
+        self.report_focus(self.focused);
+        self.pixel_scroll = 0.0;
+        self.divider_drag = None;
+        self.wake_cursor();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn cycle_pane(&mut self, forward: bool) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let count = tab.panes.len();
+        let index = (tab.active_pane + if forward { 1 } else { count - 1 }) % count;
+        self.focus_pane(index);
+    }
+
+    fn close_pane(&mut self, id: u64) {
+        let Some((ti, pi)) = self.pane_location(id) else {
+            return;
+        };
+        if self.tabs[ti].panes.len() == 1 {
+            self.close_tab(ti);
+            return;
+        }
+        let was_focused = self.tabs[ti].active_pane == pi;
+        let tab = &mut self.tabs[ti];
+        tab.layout.remove(id);
+        tab.panes.remove(pi);
+        if pi < tab.active_pane {
+            tab.active_pane -= 1;
+        }
+        tab.active_pane = tab.active_pane.min(tab.panes.len() - 1);
+        if ti == self.active {
+            self.divider_drag = None;
+            if was_focused {
+                self.selecting = false;
+                self.mouse_buttons = 0;
+                self.pixel_scroll = 0.0;
+                self.report_focus(self.focused);
+                self.wake_cursor();
+            }
+        }
+        self.sync_grid();
+        self.update_title();
     }
 
     fn report_focus(&mut self, focused: bool) {
@@ -228,6 +449,7 @@ impl App {
             self.report_focus(self.focused);
         }
         self.selecting = false;
+        self.divider_drag = None;
         self.mouse_buttons = 0;
         self.pixel_scroll = 0.0;
         self.wake_cursor();
@@ -297,16 +519,40 @@ impl App {
 
     fn redraw(&mut self) {
         let paint = self.cursor_paint();
-        let titles: Vec<String> = self.tabs.iter().map(|tab| tab.title.clone()).collect();
+        let titles: Vec<String> = self
+            .tabs
+            .iter()
+            .map(|tab| tab.title().to_string())
+            .collect();
+        let profile_label = self.profile_label();
         let retry = match (self.renderer.as_mut(), self.tabs.get(self.active)) {
             (Some(renderer), Some(tab)) => {
+                let panes: Vec<PanePaint<'_>> = tab
+                    .panes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pane)| PanePaint {
+                        terminal: &pane.terminal,
+                        font: pane.font,
+                        palette: &pane.profile.palette,
+                        rect: pane.rect,
+                        cursor: if i == tab.active_pane {
+                            paint
+                        } else if pane.terminal.mode().contains(TermMode::SHOW_CURSOR) {
+                            CursorPaint::Hollow
+                        } else {
+                            CursorPaint::Off
+                        },
+                        focused: i == tab.active_pane,
+                    })
+                    .collect();
                 matches!(
                     renderer.draw(
-                        &tab.terminal,
+                        &panes,
                         &self.config.palette,
-                        paint,
                         &titles,
-                        self.active
+                        self.active,
+                        profile_label.as_deref()
                     ),
                     DrawResult::Retry
                 )
@@ -326,24 +572,42 @@ impl App {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.resize(size.width, size.height);
         }
-        let Some((cell_w, cell_h)) = self.renderer.as_ref().map(Renderer::cell_size) else {
+        if self.renderer.is_none() {
             return;
-        };
+        }
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let cols = grid_dim(size.width, cell_w, 2);
-        let height = size.height.saturating_sub(cell_h as u32);
-        let rows = grid_dim(height, cell_h, 1);
+        let Some(bounds) = self.content_bounds() else {
+            return;
+        };
         for tab in &mut self.tabs {
-            tab.terminal.resize(cols, rows);
-            if let Err(err) = tab.pty.resize(
-                cols as u16,
-                rows as u16,
-                size.width.min(u16::MAX as u32) as u16,
-                height.min(u16::MAX as u32) as u16,
-            ) {
-                eprintln!("aiterm: {err}");
+            for (id, rect) in tab.layout.rects(bounds, DIVIDER) {
+                let Some(pane) = tab.panes.iter_mut().find(|pane| pane.id == id) else {
+                    continue;
+                };
+                let (cw, ch) = self
+                    .renderer
+                    .as_ref()
+                    .expect("renderer checked above")
+                    .cell_size_for(pane.font);
+                let cols = grid_dim(rect.width, cw, 2);
+                let rows = grid_dim(rect.height, ch, 1);
+                let changed = pane.rect != rect
+                    || pane.terminal.cols() != cols
+                    || pane.terminal.rows() != rows;
+                pane.rect = rect;
+                pane.terminal.resize(cols, rows);
+                if changed {
+                    if let Err(err) = pane.pty.resize(
+                        cols as u16,
+                        rows as u16,
+                        rect.width.min(u16::MAX as u32) as u16,
+                        rect.height.min(u16::MAX as u32) as u16,
+                    ) {
+                        eprintln!("aiterm: {err}");
+                    }
+                }
             }
         }
         self.request_redraw();
@@ -362,16 +626,16 @@ impl App {
     }
 
     fn on_pty(&mut self, id: u64, bytes: Vec<u8>) {
-        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
-            return; // A queued message can outlive its closed tab.
+        let Some((ti, pi)) = self.pane_location(id) else {
+            return;
         };
-        let events = tab.terminal.process(&bytes);
+        let events = self.tabs[ti].panes[pi].terminal.process(&bytes);
         self.handle_events_for(id, events);
         self.request_redraw();
     }
 
     fn handle_events(&mut self, events: Vec<Event>) {
-        if let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) {
+        if let Some(id) = self.active_id() {
             self.handle_events_for(id, events);
         }
     }
@@ -379,16 +643,16 @@ impl App {
     fn handle_events_for(&mut self, id: u64, events: Vec<Event>) {
         for event in events {
             // Process replies for the source tab, including background tabs.
-            let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            let Some((ti, pi)) = self.pane_location(id) else {
                 return;
             };
             match event {
                 Event::Title(title) => {
-                    self.tabs[index].title = title;
+                    self.tabs[ti].panes[pi].title = title;
                     self.update_title();
                 }
                 Event::ResetTitle => {
-                    self.tabs[index].title = "aiterm".to_string();
+                    self.tabs[ti].panes[pi].title = "aiterm".to_string();
                     self.update_title();
                 }
                 Event::PtyWrite(data) => self.write_pty_to(id, data.as_bytes()),
@@ -399,18 +663,19 @@ impl App {
                     }
                 }
                 Event::ColorRequest(index_color, format) => {
-                    let rgb = self
-                        .config
+                    let pane = &self.tabs[ti].panes[pi];
+                    let rgb = pane
+                        .profile
                         .palette
-                        .dynamic(self.tabs[index].terminal.colors(), index_color);
+                        .dynamic(pane.terminal.colors(), index_color);
                     self.write_pty_to(id, format(rgb.to_vte()).as_bytes());
                 }
                 Event::TextAreaSizeRequest(format) => {
-                    let term = &self.tabs[index].terminal;
+                    let term = &self.tabs[ti].panes[pi].terminal;
                     let (cell_w, cell_h) = self
                         .renderer
                         .as_ref()
-                        .map(Renderer::cell_size)
+                        .map(|renderer| renderer.cell_size_for(self.tabs[ti].panes[pi].font))
                         .unwrap_or((8.0, 16.0));
                     self.write_pty_to(
                         id,
@@ -423,7 +688,7 @@ impl App {
                         .as_bytes(),
                     );
                 }
-                Event::Exit => self.close_tab(index),
+                Event::Exit => self.close_pane(id),
                 _ => {}
             }
         }
@@ -431,7 +696,7 @@ impl App {
 
     fn update_title(&self) {
         if let (Some(window), Some(tab)) = (&self.window, self.tabs.get(self.active)) {
-            window.set_title(&tab.title);
+            window.set_title(tab.title());
         }
     }
 
@@ -449,7 +714,7 @@ impl App {
     }
 
     fn write_pty(&mut self, bytes: &[u8]) {
-        if let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) {
+        if let Some(id) = self.active_id() {
             self.write_pty_to(id, bytes);
         }
     }
@@ -458,8 +723,8 @@ impl App {
         if bytes.is_empty() {
             return;
         }
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
-            if let Err(err) = tab.pty.write(bytes) {
+        if let Some((ti, pi)) = self.pane_location(id) {
+            if let Err(err) = self.tabs[ti].panes[pi].pty.write(bytes) {
                 // Reader EOF owns session removal; a failed background reply
                 // must never close the active tab or the whole window.
                 eprintln!("aiterm: tab {id}: {err}");
@@ -494,6 +759,24 @@ impl App {
             KeyAction::PreviousTab => {
                 self.switch_tab((self.active + self.tabs.len() - 1) % self.tabs.len())
             }
+            KeyAction::SplitVertical => {
+                if let Err(err) = self.split_pane(Axis::Vertical) {
+                    eprintln!("aiterm: {err}");
+                }
+            }
+            KeyAction::SplitHorizontal => {
+                if let Err(err) = self.split_pane(Axis::Horizontal) {
+                    eprintln!("aiterm: {err}");
+                }
+            }
+            KeyAction::NextPane => self.cycle_pane(true),
+            KeyAction::PreviousPane => self.cycle_pane(false),
+            KeyAction::ClosePane => {
+                if let Some(id) = self.active_id() {
+                    self.close_pane(id);
+                }
+            }
+            KeyAction::CycleProfile => self.cycle_profile(),
             KeyAction::None => {}
         }
     }
@@ -538,6 +821,10 @@ impl App {
     }
 
     fn on_focus(&mut self, focused: bool) {
+        if !focused {
+            self.divider_drag = None;
+            self.release_mouse();
+        }
         self.focused = focused;
         self.wake_cursor();
         let report = self
@@ -552,14 +839,17 @@ impl App {
     }
 
     fn cell_at(&self) -> Option<(usize, usize, Side)> {
-        let (cell_w, cell_h) = self.renderer.as_ref()?.cell_size();
+        let (cell_w, cell_h) = self.renderer.as_ref()?.cell_size_for(self.pane()?.font);
         let cols = self.terminal()?.cols();
         let rows = self.terminal()?.rows();
         if cell_w < 1.0 || cell_h < 1.0 || cols == 0 || rows == 0 {
             return None;
         }
-        let mut col = (self.pointer.x / f64::from(cell_w)).floor() as isize;
-        let mut row = ((self.pointer.y - f64::from(cell_h)) / f64::from(cell_h)).floor() as isize;
+        let rect = self.pane()?.rect;
+        let local_x = self.pointer.x - f64::from(rect.x);
+        let local_y = self.pointer.y - f64::from(rect.y);
+        let mut col = (local_x / f64::from(cell_w)).floor() as isize;
+        let mut row = (local_y / f64::from(cell_h)).floor() as isize;
         let past_right = col >= cols as isize;
         let past_left = col < 0;
         col = col.clamp(0, cols as isize - 1);
@@ -569,7 +859,7 @@ impl App {
         } else if past_left {
             Side::Left
         } else {
-            let x_in = self.pointer.x - col as f64 * f64::from(cell_w);
+            let x_in = local_x - col as f64 * f64::from(cell_w);
             if x_in > f64::from(cell_w) / 2.0 {
                 Side::Right
             } else {
@@ -630,6 +920,9 @@ impl App {
 
     fn on_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         let pressed = state == ElementState::Pressed;
+        if !pressed && button == MouseButton::Left && self.divider_drag.take().is_some() {
+            return;
+        }
         if self.over_tab_bar() {
             if pressed && button == MouseButton::Left {
                 let width = self
@@ -642,7 +935,21 @@ impl App {
                     .as_ref()
                     .map(|r| r.cell_size().0)
                     .unwrap_or(8.0);
-                match crate::tab_bar::hit(self.pointer.x as f32, width, cell_w, self.tabs.len()) {
+                let badge = if self.config.profiles.is_empty() {
+                    0.0
+                } else {
+                    crate::tab_bar::profile_width(width, cell_w)
+                };
+                if self.pointer.x >= f64::from(width - badge) && badge > 0.0 {
+                    self.cycle_profile();
+                    return;
+                }
+                match crate::tab_bar::hit(
+                    self.pointer.x as f32,
+                    width - badge,
+                    cell_w,
+                    self.tabs.len(),
+                ) {
                     Some(crate::tab_bar::Hit::Select(index)) => self.switch_tab(index),
                     Some(crate::tab_bar::Hit::Close(index)) => self.close_tab(index),
                     Some(crate::tab_bar::Hit::New) => {
@@ -673,6 +980,28 @@ impl App {
             return;
         }
         if pressed {
+            if button == MouseButton::Left {
+                if let Some(bounds) = self.content_bounds() {
+                    if let Some(path) = self.tabs[self.active].layout.divider_at(
+                        bounds,
+                        DIVIDER,
+                        self.pointer.x,
+                        self.pointer.y,
+                    ) {
+                        self.release_mouse();
+                        self.divider_drag = Some(path);
+                        return;
+                    }
+                }
+            }
+            let pane = self.tabs[self.active]
+                .panes
+                .iter()
+                .position(|pane| pane.rect.contains(self.pointer.x, self.pointer.y));
+            let Some(index) = pane else {
+                return;
+            };
+            self.focus_pane(index);
             self.note_button(button, true);
         }
         let shift = self.modifiers.shift_key();
@@ -713,6 +1042,18 @@ impl App {
 
     fn on_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
         self.pointer = position;
+        if let Some(path) = self.divider_drag.clone() {
+            if let Some(bounds) = self.content_bounds() {
+                let (min_w, min_h) = self.leaf_minimum();
+                if self.tabs[self.active]
+                    .layout
+                    .resize_divider(&path, bounds, DIVIDER, position.x, position.y, min_w, min_h)
+                {
+                    self.sync_grid();
+                }
+            }
+            return;
+        }
         if self.selecting {
             if let Some((col, row, side)) = self.cell_at() {
                 if let Some(terminal) = self.terminal_mut() {
@@ -722,7 +1063,14 @@ impl App {
             self.request_redraw();
             return;
         }
-        if !self.over_tab_bar() && self.mouse_mode() && !self.modifiers.shift_key() {
+        if !self.over_tab_bar()
+            && (self.mouse_buttons != 0
+                || self
+                    .pane()
+                    .is_some_and(|pane| pane.rect.contains(self.pointer.x, self.pointer.y)))
+            && self.mouse_mode()
+            && !self.modifiers.shift_key()
+        {
             let mode = match self.terminal() {
                 Some(terminal) => terminal.mode(),
                 None => return,
@@ -741,13 +1089,17 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        if self.over_tab_bar() {
+        if self.divider_drag.is_some()
+            || !self
+                .pane()
+                .is_some_and(|pane| pane.rect.contains(self.pointer.x, self.pointer.y))
+        {
             return;
         }
         let cell_h = self
             .renderer
             .as_ref()
-            .map(|renderer| renderer.cell_size().1)
+            .and_then(|renderer| self.pane().map(|pane| renderer.cell_size_for(pane.font).1))
             .unwrap_or(16.0);
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, y) => input::notch_to_lines(y),
@@ -874,9 +1226,9 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Pty(id, bytes) => self.on_pty(id, bytes),
             UserEvent::Closed(id) => {
-                if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
-                    eprintln!("aiterm: tab {id} shell exited");
-                    self.close_tab(index);
+                if self.pane_location(id).is_some() {
+                    eprintln!("aiterm: pane {id} shell exited");
+                    self.close_pane(id);
                 }
             }
         }
@@ -913,14 +1265,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.composition = Composition::default();
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
-                self.composition
-                    .preedit(&text, self.tabs.get(self.active).map(|tab| tab.id));
+                self.composition.preedit(&text, self.active_id());
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if self
-                    .composition
-                    .commit(self.tabs.get(self.active).map(|tab| tab.id))
-                {
+                if self.composition.commit(self.active_id()) {
                     self.wake_cursor();
                     self.write_input(text.as_bytes());
                 }

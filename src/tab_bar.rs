@@ -59,6 +59,14 @@ pub fn hit(x: f32, width: f32, cell_w: f32, count: usize) -> Option<Hit> {
     }
 }
 
+/// Reserve a small profile selector at the right of the tab bar.
+pub fn profile_width(width: f32, cell_w: f32) -> f32 {
+    if !width.is_finite() || !cell_w.is_finite() || width <= 0.0 || cell_w <= 0.0 {
+        return 0.0;
+    }
+    (24.0 * cell_w).min(width / 3.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
