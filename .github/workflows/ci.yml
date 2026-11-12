@@ -33,6 +33,15 @@ jobs:
       - name: Check executable
         if: runner.os == 'Windows'
         run: .\target\release\aiterm.exe --help
+      - name: Test release source selection
+        if: runner.os == 'Windows'
+        run: pwsh -NoProfile -File scripts/windows/test-release-source.ps1
+      - name: Test installer on Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-install.ps1
+      - name: Test installer on PowerShell 7
+        if: runner.os == 'Windows'
+        run: pwsh -NoProfile -File scripts/windows/test-install.ps1
       - name: Upload Windows executable
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4

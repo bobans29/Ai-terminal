@@ -4,7 +4,22 @@ A cross-platform GPU terminal with tabs and split panes. Each tab contains a hor
 
 New tabs and panes use the selected profile's settings, falling back to the global settings. The project is aimed at Windows, macOS, and Linux.
 
-## Build and run
+## Install on Windows
+
+On x64 Windows 10 (1809+) or Windows 11, open PowerShell and run:
+
+```powershell
+irm https://github.com/bobans29/Ai-terminal/releases/latest/download/install.ps1 | iex
+aiterm
+```
+
+No administrator rights, Rust, or Visual Studio required. The installer verifies the release ZIP's SHA-256 checksum, installs to `%LOCALAPPDATA%\Programs\aiterm`, and adds it to your user PATH. Updates use the same command; close aiterm first. Personal configuration is preserved. The executable is currently unsigned.
+
+Alternatively, download `aiterm-windows-x86_64.zip` from [Releases](https://github.com/bobans29/Ai-terminal/releases), extract it, and run `aiterm.exe`.
+
+The command becomes available after the first Windows release is published. Maintainers: after merging, run **Actions → Windows release → Run workflow** with a tag such as `v0.1.0`. Future `v*` tags also publish a release.
+
+## Build from source (developers)
 
 Install Rust 1.99.1, the version used by CI. Transitive crates use Rust edition 2024, so older toolchains may fail while resolving dependencies.
 
@@ -23,7 +38,7 @@ cargo +1.99.1 build --release --locked
 
 The first launch prints the config path it looked for and the GPU adapter it opened.
 
-### Windows build
+### Windows build from source
 
 Use Windows 10 version 1809 or later (ConPTY is required), or Windows 11, on x86-64. Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) with **Desktop development with C++**, including the MSVC x64 build tools and a Windows SDK, then install Rust with the MSVC host toolchain using [rustup](https://rustup.rs/). A Direct3D 12 or Vulkan-capable graphics driver and a monospace font such as Consolas are required.
 
