@@ -27,6 +27,11 @@ jobs:
         shell: pwsh
         run: |
           if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Use a tag such as v0.1.0' }
+      - name: Select release source
+        shell: pwsh
+        run: |
+          $commit = & ./scripts/windows/select-release-source.ps1 -Tag $env:RELEASE_TAG
+          "RELEASE_COMMIT=$commit" >> $env:GITHUB_ENV
       - name: Install Rust
         run: rustup toolchain install 1.99.1 --profile minimal --component clippy
       - name: Validate and build
@@ -53,5 +58,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create $env:RELEASE_TAG --target $env:GITHUB_SHA --title "aiterm $env:RELEASE_TAG" --generate-notes aiterm-windows-x86_64.zip aiterm-windows-x86_64.zip.sha256 install.ps1
+          gh release create $env:RELEASE_TAG --target $env:RELEASE_COMMIT --title "aiterm $env:RELEASE_TAG" --generate-notes aiterm-windows-x86_64.zip aiterm-windows-x86_64.zip.sha256 install.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
