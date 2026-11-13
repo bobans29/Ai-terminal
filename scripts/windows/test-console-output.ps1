@@ -5,14 +5,22 @@ using System;
 using System.Text;
 using System.Runtime.InteropServices;
 public static class ConsoleOutputProbe {
-    [DllImport("kernel32.dll")] public static extern bool AllocConsole();
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool AllocConsole();
     [DllImport("kernel32.dll")] public static extern bool FreeConsole();
-    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern bool ReadConsoleOutputCharacter(IntPtr output, StringBuilder text, uint length, uint origin, out uint read);
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+    public static void CreateIsolatedConsole() {
+        // A headless runner can already be attached without a console window.
+        FreeConsole();
+        if (!AllocConsole()) {
+            int error = Marshal.GetLastWin32Error();
+            throw new System.ComponentModel.Win32Exception(error,
+                "Could not allocate test console (Win32 error " + error + ")");
+        }
+    }
     public static string Read() {
         IntPtr output = CreateFile("CONOUT$", 0x80000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
         if (output == new IntPtr(-1)) throw new Exception("Could not open console buffer");
@@ -26,8 +34,7 @@ public static class ConsoleOutputProbe {
     }
 }
 '@
-$created = [ConsoleOutputProbe]::GetConsoleWindow() -eq [IntPtr]::Zero
-if ($created -and -not [ConsoleOutputProbe]::AllocConsole()) { throw 'Could not allocate test console' }
+[ConsoleOutputProbe]::CreateIsolatedConsole()
 try {
     $executable = (Resolve-Path (Join-Path $PSScriptRoot '..\..\target\release\aiterm.exe')).Path
     $cases = @(
@@ -54,6 +61,6 @@ try {
         } finally { $process.Dispose() }
     }
 } finally {
-    if ($created) { [ConsoleOutputProbe]::FreeConsole() | Out-Null }
+    [ConsoleOutputProbe]::FreeConsole() | Out-Null
 }
 Write-Host 'Unredirected CLI help and error output passed.'
